@@ -42,6 +42,14 @@ Open the panel with **N** in the 3D viewport, then the **Blueprint** tab.
 The **Dimensions** sub-panel picks what gets measured, and **Preview** draws the result
 live over the viewport.
 
+![preview](docs/preview.png)
+
+Preview refresh is explicit, not automatic: rebuilding bakes Line Art, which is far too
+heavy to run on every viewport redraw, so the panel tells you when the cached preview has
+gone stale. Two honest differences from the file output — hidden lines show translucent
+rather than dashed, since GPU line drawing has no dash pattern, and text uses Blender's
+own font rather than Helvetica.
+
 The add-on saves and restores everything it touches — your camera, frame range, render
 engine, resolution and viewport shading all come back as they were, and the temporary
 cameras and Line Art object are deleted. It will not disturb the scene you are working in.
@@ -216,6 +224,10 @@ Caveats, also emitted into `dimensions.json`:
   box than its true size — use that object's `local_dimensions` instead.
 - Line Art follows the mesh, so a tessellated curve reads as facets.
 - The stated scale assumes the SVG is printed at its declared physical page size.
+- Dimension placement avoids other dimensions, but not the linework itself, so a label can
+  land on top of the drawing on a busy view. Turn off sources you do not need.
+- Auto circle detection tests face vertex rings, which catches cylinder caps and most
+  holes cheaply, but not circles built from separate edge loops.
 
 ## License
 
