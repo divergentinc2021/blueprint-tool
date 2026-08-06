@@ -16,9 +16,13 @@ import json
 import math
 import os
 
+import bmesh
 import bpy
 from mathutils import Vector
 from bpy_extras.object_utils import world_to_camera_view
+
+from . import annotate, render
+from .render import fmt
 
 # ---------------------------------------------------------------- constants
 # Blender is Z-up. Each view records which world axis maps to screen right / up so the
@@ -49,9 +53,6 @@ PAGES = {
 IMPORTABLE = (".fbx", ".blend", ".obj", ".glb", ".gltf", ".stl", ".ply",
               ".usd", ".usda", ".usdc", ".usdz")
 
-INK = "#1a2b4c"
-FAINT = "#8a97ad"
-
 DEFAULTS = dict(
     source=None,            # path to import; ignored when use_current_scene is True
     use_current_scene=False,
@@ -59,13 +60,27 @@ DEFAULTS = dict(
     views=("front", "right", "top", "iso"),
     unit="m",
     page="a4l",
+    theme="white",
+    layout="sheet",         # "sheet" = one page per view; "plate" = all views on one page
+    grid=False,
     margin=0.18,
     crease=140.0,
+    silhouette=True,
     hidden=False,
     dims=True,
     png=False,
+    pdf=False,
     title=None,
     log=print,
+    # dimension sources; see annotate.collect
+    dim_overall=True,
+    dim_objects=False,
+    dim_edges=False,
+    dim_auto=False,
+    dim_empties=False,
+    dim_angle=True,
+    dim_radius_not_dia=False,
+    dim_kinds=None,         # None means every kind
 )
 
 
@@ -295,6 +310,7 @@ def make_camera(name, spec, mn, mx, res_x, res_y, margin, guard=None):
         "screen_right_axis": [round(v, 6) for v in right],
         "screen_up_axis": [round(v, 6) for v in up],
         "screen_right_label": axes[0], "screen_up_label": axes[1],
+        "screen_out_axis": [round(v, 6) for v in out],
         "camera_location": [round(v, 6) for v in cam.location],
         "view_centre_world": [round(v, 6) for v in centre],
         "projection": "px = world_to_camera_view(scene, cam, P); "
@@ -323,6 +339,74 @@ def make_lineart(crease_deg, guard=None):
             except Exception:
                 pass
     return gp, mod
+
+
+def mark_silhouette(objs, out_axis):
+    """
+    Mark this view's silhouette edges as Freestyle edge marks, and return a restore call.
+
+    Line Art draws creases, boundaries and intersections, but produces no contour for a
+    smooth curved surface: a plain cylinder comes out as two cap rings with nothing joining
+    them, because its side edges meet at ~169 degrees and so are not creases. Raising the
+    crease threshold far enough to catch them turns the cylinder into a striped barrel
+    instead, since every side edge qualifies.
+
+    A silhouette edge is one whose two faces disagree about facing the camera (or a
+    boundary edge with a single face). Computing that here and handing it to Line Art as
+    edge marks means Line Art still does the occlusion, so the silhouette is hidden behind
+    other geometry exactly like the rest of the linework — which drawing it ourselves on
+    top would not achieve.
+
+    Silhouettes are view-dependent, so this is redone per view.
+    """
+    saved = []
+    for o in objs:
+        me = o.data
+        n_edges = len(me.edges)
+        if not n_edges:
+            continue
+
+        # Blender 5.0 stores freestyle marks as a generic BOOLEAN attribute on the EDGE
+        # domain; MeshEdge.use_freestyle_mark no longer exists.
+        attr = me.attributes.get("freestyle_edge")
+        existed = attr is not None
+        if not existed:
+            attr = me.attributes.new(name="freestyle_edge", type="BOOLEAN", domain="EDGE")
+        before = [False] * n_edges
+        attr.data.foreach_get("value", before)
+        saved.append((me, before, existed))
+
+        # inverse transpose so non-uniform scale still yields correct normals
+        nmat = o.matrix_world.to_3x3().inverted_safe().transposed()
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        bm.edges.ensure_lookup_table()
+        marks = list(before)
+        for e in bm.edges:
+            faces = e.link_faces
+            if len(faces) == 1:
+                marks[e.index] = True            # open boundary is always a silhouette
+            elif len(faces) == 2:
+                d0 = (nmat @ faces[0].normal).dot(out_axis)
+                d1 = (nmat @ faces[1].normal).dot(out_axis)
+                if (d0 > 0.0) != (d1 > 0.0):     # faces disagree about facing the camera
+                    marks[e.index] = True
+        bm.free()
+        attr.data.foreach_set("value", marks)
+        me.update()
+
+    def restore():
+        for me, before, existed in saved:
+            attr = me.attributes.get("freestyle_edge")
+            if attr is None:
+                continue
+            if existed:
+                attr.data.foreach_set("value", before)
+            else:
+                me.attributes.remove(attr)       # we created it; leave no trace
+            me.update()
+
+    return restore
 
 
 def bake_strokes(gp):
@@ -373,136 +457,6 @@ def read_strokes(gp, scene, cam, res_x, res_y):
     return polylines
 
 
-# ---------------------------------------------------------------- svg
-def esc(s):
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def fmt(v, unit):
-    if unit in ("mm", "cm"):
-        return ("%.1f" % v).rstrip("0").rstrip(".")
-    return "%.3f" % v
-
-
-def path_d(points):
-    out = ["M%.2f,%.2f" % points[0]]
-    for x, y in points[1:]:
-        out.append("L%.2f,%.2f" % (x, y))
-    return "".join(out)
-
-
-def dim_group(bbox_px, w_val, h_val, unit, w_lbl, h_lbl, fs, pad):
-    """Horizontal dimension under the model, vertical dimension to its left."""
-    x0, y0, x1, y1 = bbox_px
-    g = ['<g id="dimensions" fill="%s" stroke="%s" stroke-width="2" '
-         'font-family="Helvetica,Arial,sans-serif" font-size="%.0f">' % (INK, INK, fs)]
-    ah = fs * 0.42
-
-    def arrow(x, y, dx, dy):
-        px, py = -dy, dx
-        return ('<polygon points="%.1f,%.1f %.1f,%.1f %.1f,%.1f" stroke="none"/>'
-                % (x, y, x - dx * ah * 2 + px * ah * 0.5, y - dy * ah * 2 + py * ah * 0.5,
-                   x - dx * ah * 2 - px * ah * 0.5, y - dy * ah * 2 - py * ah * 0.5))
-
-    dy = y1 + pad
-    g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
-             % (x0, y1, x0, dy + fs * 0.6, FAINT))
-    g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
-             % (x1, y1, x1, dy + fs * 0.6, FAINT))
-    g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (x0, dy, x1, dy))
-    g.append(arrow(x0, dy, -1, 0))
-    g.append(arrow(x1, dy, 1, 0))
-    g.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#ffffff" stroke="none"/>'
-             % ((x0 + x1) / 2 - fs * 3.2, dy - fs * 0.78, fs * 6.4, fs * 1.15))
-    g.append('<text x="%.1f" y="%.1f" text-anchor="middle" stroke="none">%s %s</text>'
-             % ((x0 + x1) / 2, dy + fs * 0.33, fmt(w_val, unit), unit))
-    if w_lbl:
-        g.append('<text x="%.1f" y="%.1f" text-anchor="middle" stroke="none" fill="%s" '
-                 'font-size="%.0f">%s</text>'
-                 % ((x0 + x1) / 2, dy + fs * 1.5, FAINT, fs * 0.72, w_lbl))
-
-    dx = x0 - pad
-    g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
-             % (x0, y0, dx - fs * 0.6, y0, FAINT))
-    g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
-             % (x0, y1, dx - fs * 0.6, y1, FAINT))
-    g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (dx, y0, dx, y1))
-    g.append(arrow(dx, y0, 0, -1))
-    g.append(arrow(dx, y1, 0, 1))
-    cy = (y0 + y1) / 2
-    g.append('<g transform="translate(%.1f,%.1f) rotate(-90)">' % (dx, cy))
-    g.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#ffffff" stroke="none"/>'
-             % (-fs * 3.2, -fs * 0.78, fs * 6.4, fs * 1.15))
-    g.append('<text x="0" y="%.1f" text-anchor="middle" stroke="none">%s %s</text>'
-             % (fs * 0.33, fmt(h_val, unit), unit))
-    if h_lbl:
-        g.append('<text x="0" y="%.1f" text-anchor="middle" stroke="none" fill="%s" '
-                 'font-size="%.0f">%s</text>' % (fs * 1.5, FAINT, fs * 0.72, h_lbl))
-    g.append("</g></g>")
-    return "".join(g)
-
-
-def title_block(px_w, px_h, fs, rows):
-    bw, bh = fs * 20.0, fs * (1.6 + 1.35 * len(rows))
-    x, y = px_w - bw - fs * 1.6, px_h - bh - fs * 1.6
-    g = ['<g id="titleblock" font-family="Helvetica,Arial,sans-serif">']
-    g.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#ffffff" '
-             'stroke="%s" stroke-width="2.5"/>' % (x, y, bw, bh, INK))
-    ty = y + fs * 1.5
-    for i, (k, v) in enumerate(rows):
-        if i == 0:
-            # shrink then truncate so a long filename cannot run outside the box
-            title_fs = fs * 1.05
-            avail = bw - fs * 1.4
-            while title_fs > fs * 0.62 and len(v) * title_fs * 0.56 > avail:
-                title_fs *= 0.94
-            maxc = max(8, int(avail / (title_fs * 0.56)))
-            shown = v if len(v) <= maxc else v[:maxc - 1] + "…"
-            g.append('<text x="%.1f" y="%.1f" font-size="%.0f" font-weight="700" fill="%s">'
-                     '%s</text>' % (x + fs * 0.7, ty, title_fs, INK, esc(shown)))
-            g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" '
-                     'stroke-width="1.5"/>' % (x, ty + fs * 0.45, x + bw, ty + fs * 0.45, INK))
-            ty += fs * 1.75
-            continue
-        g.append('<text x="%.1f" y="%.1f" font-size="%.0f" fill="%s">%s</text>'
-                 % (x + fs * 0.7, ty, fs * 0.8, FAINT, esc(k)))
-        g.append('<text x="%.1f" y="%.1f" font-size="%.0f" fill="%s" text-anchor="end">%s</text>'
-                 % (x + bw - fs * 0.7, ty, fs * 0.8, INK, esc(v)))
-        ty += fs * 1.35
-    g.append("</g>")
-    return "".join(g)
-
-
-def write_svg(path, page, polylines, hidden_lines, bbox_px, dims, meta):
-    mm_w, mm_h, px_w, px_h = page
-    fs = px_h * 0.0165
-    parts = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" '
-        'width="%gmm" height="%gmm" viewBox="0 0 %d %d">' % (mm_w, mm_h, px_w, px_h),
-        '<rect width="%d" height="%d" fill="#ffffff"/>' % (px_w, px_h),
-        '<rect x="%.0f" y="%.0f" width="%.0f" height="%.0f" fill="none" stroke="%s" '
-        'stroke-width="3"/>' % (fs, fs, px_w - 2 * fs, px_h - 2 * fs, INK),
-    ]
-    if hidden_lines:
-        parts.append('<g id="hidden" fill="none" stroke="%s" stroke-width="2" '
-                     'stroke-dasharray="14 10" stroke-linecap="round">' % FAINT)
-        parts += ['<path d="%s"/>' % path_d(p) for p in hidden_lines]
-        parts.append("</g>")
-    parts.append('<g id="linework" fill="none" stroke="%s" stroke-width="3.2" '
-                 'stroke-linecap="round" stroke-linejoin="round">' % INK)
-    parts += ['<path d="%s"/>' % path_d(p) for p in polylines]
-    parts.append("</g>")
-    if dims:
-        parts.append(dim_group(bbox_px, dims["w"], dims["h"], dims["unit"],
-                               dims["w_label"], dims["h_label"], fs, fs * 3.0))
-    parts.append(title_block(px_w, px_h, fs, meta))
-    parts.append("</svg>")
-    with open(path, "w") as f:
-        f.write("\n".join(parts))
-
-
 # ---------------------------------------------------------------- png
 def setup_render(scene, px_w, px_h):
     r = scene.render
@@ -523,8 +477,14 @@ def setup_render(scene, px_w, px_h):
 
 
 # ---------------------------------------------------------------- entry point
-def generate(**kwargs):
-    """Produce drawings + dimensions.json. Returns the report dict."""
+def generate(sheets_out=None, write=True, **kwargs):
+    """
+    Produce drawings + dimensions.json. Returns the report dict.
+
+    sheets_out: optional dict, filled with {view_name: Sheet} for callers that want to
+                render the drawing themselves (the viewport preview does).
+    write:      set False to build everything in memory and write nothing.
+    """
     o = dict(DEFAULTS)
     o.update(kwargs)
     log = o["log"] or (lambda *a: None)
@@ -540,7 +500,8 @@ def generate(**kwargs):
         raise ValueError("unknown page " + str(o["page"]))
 
     out_dir = os.path.abspath(bpy.path.abspath(o["out_dir"]))
-    os.makedirs(out_dir, exist_ok=True)
+    if write:
+        os.makedirs(out_dir, exist_ok=True)
     page = PAGES[o["page"]]
     mm_w, mm_h, px_w, px_h = page
 
@@ -570,6 +531,46 @@ def generate(**kwargs):
                            if src != "<current scene>" else "Untitled")
     d = scene_dims["dimensions"]
     views_meta = {}
+    sheets = {}
+
+    plate = o["layout"] == "plate"
+    fs_page = px_h * 0.0165
+    if plate:
+        # Lay the views out in a grid whose cell aspect stays close to the page aspect,
+        # leaving a band at the bottom for the title block.
+        n = len(o["views"])
+        pad = fs_page * 1.8
+        band = fs_page * (1.6 + 1.35 * 6) + fs_page * 2.4
+        page_aspect = (px_w - 2 * pad) / float(px_h - 2 * pad - band)
+        # Pick the grid whose cells are closest in shape to the page, preferring one with
+        # no empty slots. sqrt(n * aspect) alone puts 4 views in 3 columns and leaves a
+        # hole, which reads as a mistake on a poster.
+        best = None
+        for c in range(1, n + 1):
+            r = int(math.ceil(n / float(c)))
+            cell_aspect = (page_aspect * r) / float(c)
+            score = abs(math.log(cell_aspect / page_aspect)) + 0.35 * (c * r - n)
+            if best is None or score < best[0]:
+                best = (score, c, r)
+        cols, rows = best[1], best[2]
+        band = fs_page * (1.6 + 1.35 * 6) + fs_page * 2.4      # title block height
+        area_w = px_w - 2 * pad
+        area_h = px_h - 2 * pad - band
+        cell_w = int((area_w - pad * (cols - 1)) / cols)
+        cell_h = int((area_h - pad * (rows - 1)) / rows)
+        if cell_w < 80 or cell_h < 80:
+            raise ValueError("too many views for one plate at this page size")
+        cells = {}
+        for i, nm in enumerate(o["views"]):
+            r, c = divmod(i, cols)
+            cells[nm] = (pad + c * (cell_w + pad), pad + r * (cell_h + pad), cell_w, cell_h)
+        page_sheet = render.Sheet(px_w, px_h, mm_w, mm_h, o["theme"])
+        render.draw_frame(page_sheet, fs_page)
+        if o["grid"]:
+            render.draw_grid(page_sheet, fs_page)
+    else:
+        cells = {nm: (0, 0, px_w, px_h) for nm in o["views"]}
+        page_sheet = None
 
     # Restore the user's scene afterwards when running inside the GUI; the CLI is a
     # throwaway process and skips the bookkeeping.
@@ -581,45 +582,49 @@ def generate(**kwargs):
         gp, mod = make_lineart(o["crease"], guard)
 
         for name in o["views"]:
+            cell_x, cell_y, cw, ch = cells[name]
+            # world_to_camera_view normalises against the scene render resolution, so it
+            # must match the cell the view is drawn into or the projection is stretched
+            scene.render.resolution_x, scene.render.resolution_y = cw, ch
             cam, mapping = make_camera("bp_cam_" + name, VIEWS[name], mn, mx,
-                                       px_w, px_h, o["margin"], guard)
+                                       cw, ch, o["margin"], guard)
             scene.camera = cam
             bpy.context.view_layer.update()
+
+            # out_axis points from the model toward the camera
+            restore_marks = (mark_silhouette(objs, Vector(mapping["screen_out_axis"]))
+                             if o["silhouette"] else (lambda: None))
 
             if hasattr(mod, "use_multiple_levels"):
                 mod.use_multiple_levels = False
             bake_strokes(gp)
-            visible = read_strokes(gp, scene, cam, px_w, px_h)
+            visible = read_strokes(gp, scene, cam, cw, ch)
 
             hidden = []
             if o["hidden"] and hasattr(mod, "use_multiple_levels"):
                 mod.use_multiple_levels = True
                 mod.level_start, mod.level_end = 1, 3
                 bake_strokes(gp)
-                hidden = read_strokes(gp, scene, cam, px_w, px_h)
+                hidden = read_strokes(gp, scene, cam, cw, ch)
                 mod.use_multiple_levels = False
+            restore_marks()
 
             # dimension the projected model bbox, not the linework extents
             corners = [Vector((x, y, z)) for x in (mn.x, mx.x)
                        for y in (mn.y, mx.y) for z in (mn.z, mx.z)]
             proj = [world_to_camera_view(scene, cam, c) for c in corners]
-            bx = [p.x * px_w for p in proj]
-            by = [(1 - p.y) * px_h for p in proj]
+            bx = [p.x * cw for p in proj]
+            by = [(1 - p.y) * ch for p in proj]
             bbox_px = (min(bx), min(by), max(bx), max(by))
 
             right, up = Vector(mapping["screen_right_axis"]), Vector(mapping["screen_up_axis"])
             span = mx - mn
             w_world = abs(span.dot(right)) * factor
             h_world = abs(span.dot(up)) * factor
-            scale_ratio = (mm_w / 1000.0) / mapping["ortho_scale_world"]
+            scale_ratio = ((mm_w * cw / float(px_w)) / 1000.0) / mapping["ortho_scale_world"]
             scale_text = ("1:%.1f" % (1.0 / scale_ratio)) if scale_ratio < 1 \
                 else ("%.1f:1" % scale_ratio)
 
-            dims = None if (not o["dims"] or name == "iso") else {
-                "w": w_world, "h": h_world, "unit": o["unit"],
-                "w_label": mapping["screen_right_label"],
-                "h_label": mapping["screen_up_label"],
-            }
             meta_rows = [
                 ("", title),
                 ("View", name.upper()),
@@ -630,20 +635,67 @@ def generate(**kwargs):
                 ("Date", datetime.date.today().isoformat()),
             ]
 
+            # ---- build the view at cell size; page chrome is added by whoever owns
+            #      the page (this sheet when one view per page, the plate otherwise)
+            sheet = render.Sheet(cw, ch, mm_w * cw / float(px_w), mm_h * ch / float(px_h),
+                                 o["theme"])
+            fs = ch * 0.0165 if not plate else fs_page * 0.85
+            if not plate:
+                render.draw_frame(sheet, fs)
+                if o["grid"]:
+                    render.draw_grid(sheet, fs)
+            if hidden:
+                for p in hidden:
+                    sheet.polyline(p, sheet.theme["hidden"], 2.0, dash=(14, 10))
+            for p in visible:
+                sheet.polyline(p, sheet.theme["ink"], 3.2)
+
+            n_dims = 0
+            drawn_dims = []
+            if o["dims"] and name != "iso":
+                dim_list = annotate.collect(
+                    scene, objs, mn, mx, right, up, factor, o["unit"],
+                    dict(overall=o["dim_overall"], objects=o["dim_objects"],
+                         edges=o["dim_edges"], auto=o["dim_auto"],
+                         empties=o["dim_empties"], angle=o["dim_angle"],
+                         radius_not_dia=o["dim_radius_not_dia"], kinds=o["dim_kinds"]))
+                placer = annotate.Placer(cw, ch, fs * 1.0)
+                if not plate:
+                    # reserve the title block so no dimension lands underneath it
+                    tbh = fs * (1.6 + 1.35 * len(meta_rows))
+                    placer.reserve((cw - fs * 21.6, ch - tbh - fs * 1.6, fs * 20.0, tbh))
+                n_dims = annotate.draw_dims(sheet, dim_list, scene, cam, fs, placer, bbox_px)
+                drawn_dims = [{"kind": x.kind, "label": x.label, "source": x.source,
+                               "value": round(x.unit_value, 4)
+                               if x.unit_value is not None else None}
+                              for x in dim_list]
+
+            if plate:
+                page_sheet.blit(sheet, cell_x, cell_y)
+                page_sheet.text(cell_x + cw / 2.0, cell_y + ch - fs * 0.2,
+                                name.upper(), fs * 0.85, page_sheet.theme["faint"],
+                                anchor="middle")
+            else:
+                render.draw_title_block(sheet, fs, meta_rows)
+                sheets[name] = sheet
+
             svg_path = os.path.join(out_dir, name + ".svg")
-            write_svg(svg_path, page, visible, hidden, bbox_px, dims, meta_rows)
+            if write:
+                render.write_svg(svg_path, sheet)
 
             mapping.update({
                 "svg": os.path.basename(svg_path),
                 "stroke_count": len(visible), "hidden_stroke_count": len(hidden),
-                "page_mm": [mm_w, mm_h],
+                "page_mm": [mm_w, mm_h], "theme": o["theme"],
                 "drawing_scale": round(scale_ratio, 6), "drawing_scale_text": scale_text,
                 "model_bbox_pixels": [round(v, 2) for v in bbox_px],
+                "dimensions_drawn": n_dims,
+                "dimensions": drawn_dims,
                 "dimensioned_width_" + o["unit"]: round(w_world, 4),
                 "dimensioned_height_" + o["unit"]: round(h_world, 4),
             })
 
-            if o["png"]:
+            if o["png"] and write:
                 gp.hide_render = True
                 png_path = os.path.join(out_dir, name + ".png")
                 scene.render.filepath = png_path
@@ -652,9 +704,36 @@ def generate(**kwargs):
                 mapping["png"] = os.path.basename(png_path)
 
             views_meta[name] = mapping
-            log("[view] %-7s %4d strokes%s  scale %s  -> %s"
+            log("[view] %-7s %4d strokes%s%s  scale %s  -> %s"
                 % (name, len(visible), (" +%d hidden" % len(hidden)) if hidden else "",
-                   scale_text, mapping["svg"]))
+                   (" %d dims" % n_dims) if n_dims else "", scale_text, mapping["svg"]))
+
+    if plate:
+        render.draw_title_block(page_sheet, fs_page, [
+            ("", title),
+            ("Views", ", ".join(v.upper() for v in o["views"])),
+            ("Overall", "%s x %s x %s %s" % (fmt(d["x"], o["unit"]), fmt(d["y"], o["unit"]),
+                                             fmt(d["z"], o["unit"]), o["unit"])),
+            ("Unit", o["unit"]),
+            ("Page", "%s (%gx%g mm)" % (o["page"].upper(), mm_w, mm_h)),
+            ("Date", datetime.date.today().isoformat()),
+        ])
+        sheets["plate"] = page_sheet
+        if write:
+            render.write_svg(os.path.join(out_dir, "plate.svg"), page_sheet)
+        log("[plate] %d views on one %s sheet -> plate.svg"
+            % (len(o["views"]), o["page"].upper()))
+
+    if sheets_out is not None:
+        sheets_out.update(sheets)
+
+    pdf_path = None
+    if o["pdf"] and write:
+        pdf_path = os.path.join(out_dir, "blueprints.pdf")
+        order = ["plate"] if plate else [v for v in o["views"] if v in sheets]
+        render.write_pdf(pdf_path, [sheets[v] for v in order], title)
+        log("[pdf]   %d page%s -> %s"
+            % (len(sheets), "" if len(sheets) == 1 else "s", os.path.basename(pdf_path)))
 
     report = {
         "source": src, "source_type": kind,
@@ -666,7 +745,8 @@ def generate(**kwargs):
                   "note": "Blender stores geometry in metres; reported values are "
                           "metres * scale_length * unit factor."},
         "scene": scene_dims, "objects": per_object, "views": views_meta,
-        "output_dir": out_dir,
+        "output_dir": out_dir, "theme": o["theme"], "layout": o["layout"],
+        "pdf": os.path.basename(pdf_path) if pdf_path else None,
         "caveats": [
             "Dimensions are axis-aligned bounding boxes. A part rotated off-axis reports a "
             "larger box than its true size; use local_dimensions for that part.",
@@ -674,8 +754,9 @@ def generate(**kwargs):
             "Scale assumes the SVG is printed at its declared physical page size.",
         ],
     }
-    with open(os.path.join(out_dir, "dimensions.json"), "w") as f:
-        json.dump(report, f, indent=2)
+    if write:
+        with open(os.path.join(out_dir, "dimensions.json"), "w") as f:
+            json.dump(report, f, indent=2)
 
     log("\n=== %s ===" % title)
     log("  overall  %s x %s x %s %s   (X x Y x Z)"

@@ -1,17 +1,17 @@
 """
 Blueprint Tool — Blender add-on.
 
-3D Viewport > sidebar (N) > Blueprint tab. Measures the scene and writes orthographic
-blueprint drawings: hidden-line removed, dimensioned, with a title block.
+3D Viewport > sidebar (N) > Blueprint. Measures the scene and writes orthographic
+blueprint drawings: hidden-line removed, dimensioned, with a title block, as SVG and PDF.
 
-The work happens in core.py, which the command-line entry point shares, so the add-on
-and the CLI cannot drift apart.
+The work happens in core.py, which the command-line entry point shares, so the add-on and
+the CLI cannot drift apart.
 """
 
 bl_info = {
     "name": "Blueprint Tool",
     "author": "Laurent de Laroche Souvestre",
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
     "location": "3D Viewport > Sidebar (N) > Blueprint",
     "description": "Measure a model and generate dimensioned orthographic blueprint drawings",
@@ -26,11 +26,14 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty, PointerPropert
                        StringProperty)
 from bpy.types import Operator, Panel, PropertyGroup
 
-from . import core
+from . import annotate, core, preview, render
 
 if "bpy" in locals():  # support Reload Scripts
     import importlib
+    render = importlib.reload(render)
+    annotate = importlib.reload(annotate)
     core = importlib.reload(core)
+    preview = importlib.reload(preview)
 
 
 UNIT_ITEMS = [
@@ -47,6 +50,30 @@ PAGE_ITEMS = [
     ("a3p", "A3 Portrait", "297 x 420 mm"),
     ("a2l", "A2 Landscape", "594 x 420 mm"),
 ]
+THEME_ITEMS = [
+    ("white", "White", "Dark lines on white paper"),
+    ("blueprint", "Blueprint", "White lines on traditional blueprint blue"),
+    ("cyanotype", "Cyanotype", "White lines on deep Prussian blue, the classic print look"),
+    ("sepia", "Sepia", "Dark lines on aged parchment"),
+    ("steel", "Steel", "Light lines on gunmetal grey"),
+    ("dark", "Dark", "Light lines on near-black"),
+]
+LAYOUT_ITEMS = [
+    ("sheet", "One Per Page", "A separate page for each view"),
+    ("plate", "Single Plate", "Every view laid out on one sheet, poster style"),
+]
+KIND_ITEMS = [
+    ("linear", "Linear", "Width, height and depth extents"),
+    ("length", "Length", "Distance between two points, such as an edge"),
+    ("diameter", "Diameter", "Across a circular feature"),
+    ("radius", "Radius", "From the centre of a circular feature"),
+    ("angle", "Angular", "Angle between two selected edges"),
+]
+
+
+def _stale(self, context):
+    """Any option change invalidates the cached preview."""
+    preview.mark_stale()
 
 
 # ---------------------------------------------------------------- properties
@@ -54,68 +81,113 @@ class BlueprintSettings(PropertyGroup):
     use_current_scene: BoolProperty(
         name="Use Current Scene",
         description="Draw whatever is already in the scene. Turn off to import a file first",
-        default=True,
+        default=True, update=_stale,
     )
-    source: StringProperty(
-        name="Model",
-        description="Model to import and draw",
-        subtype="FILE_PATH",
-    )
+    source: StringProperty(name="Model", description="Model to import and draw",
+                           subtype="FILE_PATH")
     out_dir: StringProperty(
-        name="Output",
-        description="Folder to write the drawings and dimensions.json into",
-        subtype="DIR_PATH",
-        default="//blueprints/",
-    )
-    title: StringProperty(
-        name="Title",
-        description="Title block heading. Leave blank to use the file name",
-    )
+        name="Output", description="Folder for the drawings and dimensions.json",
+        subtype="DIR_PATH", default="//blueprints/")
+    title: StringProperty(name="Title",
+                          description="Title block heading. Blank uses the file name",
+                          update=_stale)
 
-    unit: EnumProperty(name="Unit", items=UNIT_ITEMS, default="mm")
-    page: EnumProperty(name="Page", items=PAGE_ITEMS, default="a3l")
+    unit: EnumProperty(name="Unit", items=UNIT_ITEMS, default="mm", update=_stale)
+    page: EnumProperty(name="Page", items=PAGE_ITEMS, default="a3l", update=_stale)
+    theme: EnumProperty(name="Theme", items=THEME_ITEMS, default="white", update=_stale)
+    layout: EnumProperty(name="Layout", items=LAYOUT_ITEMS, default="sheet", update=_stale)
+    grid: BoolProperty(
+        name="Grid", description="Faint graticule behind the drawing, like blueprint paper",
+        default=False, update=_stale)
 
     margin: FloatProperty(
-        name="Margin",
-        description="Fraction of the page kept clear for dimensions and title block",
-        default=0.18, min=0.02, max=0.45, subtype="FACTOR",
-    )
+        name="Margin", description="Fraction of the page kept clear for dimensions "
+                                   "and the title block",
+        default=0.18, min=0.02, max=0.45, subtype="FACTOR", update=_stale)
     # plain degrees rather than subtype ANGLE, which stores radians and would need
     # converting on every read for no gain
     crease: FloatProperty(
         name="Crease",
-        description="Edges meeting at a sharper angle than this become lines, in degrees. "
-                    "Lower values draw more interior detail",
-        default=140.0, min=0.0, max=180.0,
-    )
+        description="Edges whose faces meet at an angle BELOW this become lines, in "
+                    "degrees. Higher values draw more interior detail",
+        default=140.0, min=0.0, max=180.0, update=_stale)
+    silhouette: BoolProperty(
+        name="Silhouette",
+        description="Add the true outline of curved surfaces. Line Art alone draws no "
+                    "contour for a smooth surface, so a cylinder comes out as two rings "
+                    "with no sides",
+        default=True, update=_stale)
     hidden: BoolProperty(
         name="Hidden",
         description="Draw occluded edges as dashed lines. Roughly doubles generation time",
-        default=True,
-    )
-    dims: BoolProperty(
-        name="Dims",
-        description="Draw dimension lines and values. The isometric view never gets them",
-        default=True,
-    )
-    png: BoolProperty(
-        name="PNG",
-        description="Also render a shaded reference image per view",
-        default=False,
-    )
+        default=True, update=_stale)
+    dims: BoolProperty(name="Dims", description="Draw dimension lines and values",
+                       default=True, update=_stale)
+    png: BoolProperty(name="PNG", description="Also render a shaded reference image per view",
+                      default=False)
+    pdf: BoolProperty(name="PDF", description="Also write one multi-page PDF of all views",
+                      default=True)
+
+    # -- dimension sources
+    dim_overall: BoolProperty(
+        name="Overall", description="The model's total extents in each view",
+        default=True, update=_stale)
+    dim_objects: BoolProperty(
+        name="Selected Objects",
+        description="Bounding box of each selected object, in Object Mode",
+        default=False, update=_stale)
+    dim_edges: BoolProperty(
+        name="Selected Edges",
+        description="Length of each selected mesh edge. Two selected edges also give the "
+                    "angle between them; a selected circular loop gives its diameter",
+        default=False, update=_stale)
+    dim_auto: BoolProperty(
+        name="Auto Circles",
+        description="Find circular features automatically and dimension them",
+        default=False, update=_stale)
+    dim_empties: BoolProperty(
+        name="Empties",
+        description="Distance between Empties, paired in name order: 1st to 2nd, "
+                    "3rd to 4th, and so on",
+        default=False, update=_stale)
+    dim_radius_not_dia: BoolProperty(
+        name="Radius", description="Circular features as radius instead of diameter",
+        default=False, update=_stale)
+
+    preview_view: EnumProperty(
+        name="Preview",
+        items=[(v, v.capitalize(), "Preview the %s view" % v) for v in core.VIEW_ORDER],
+        default="front", update=_stale)
 
     last_result: StringProperty(default="")
     last_output: StringProperty(default="")
 
 
-def _view_prop(name, default):
-    return BoolProperty(name=name.capitalize(), default=default)
-
-
 for _v in core.VIEW_ORDER:
-    setattr(BlueprintSettings, "__annotations__", getattr(BlueprintSettings, "__annotations__", {}))
-    BlueprintSettings.__annotations__["view_" + _v] = _view_prop(
-        _v, _v in ("front", "right", "top", "iso"))
+    BlueprintSettings.__annotations__["view_" + _v] = BoolProperty(
+        name=_v.capitalize(), default=_v in ("front", "right", "top", "iso"))
+for _k, _lbl, _desc in KIND_ITEMS:
+    BlueprintSettings.__annotations__["kind_" + _k] = BoolProperty(
+        name=_lbl, description=_desc, default=True, update=_stale)
+
+
+def _opts(s, views):
+    """Translate the property group into core.generate() keyword arguments."""
+    kinds = [k for k, _l, _d in KIND_ITEMS if getattr(s, "kind_" + k)]
+    return dict(
+        use_current_scene=s.use_current_scene,
+        source=(None if s.use_current_scene else bpy.path.abspath(s.source)),
+        out_dir=bpy.path.abspath(s.out_dir),
+        views=views, unit=s.unit, page=s.page, theme=s.theme,
+        layout=s.layout, grid=s.grid,
+        margin=s.margin, crease=s.crease, silhouette=s.silhouette,
+        hidden=s.hidden, dims=s.dims, png=s.png, pdf=s.pdf,
+        title=(s.title or None),
+        dim_overall=s.dim_overall, dim_objects=s.dim_objects, dim_edges=s.dim_edges,
+        dim_auto=s.dim_auto, dim_empties=s.dim_empties,
+        dim_radius_not_dia=s.dim_radius_not_dia,
+        dim_kinds=(kinds if len(kinds) < len(KIND_ITEMS) else None),
+    )
 
 
 # ---------------------------------------------------------------- operators
@@ -141,13 +213,14 @@ class BLUEPRINT_OT_import(Operator):
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
         s.use_current_scene = True
+        preview.mark_stale()
         self.report({"INFO"}, "Imported %s (%s)" % (os.path.basename(path), kind))
         return {"FINISHED"}
 
 
 class BLUEPRINT_OT_generate(Operator):
     bl_idname = "blueprint.generate"
-    bl_label = "Generate Blueprints"
+    bl_label = "Generate"
     bl_description = "Measure the model and write the drawings"
     bl_options = {"REGISTER"}
 
@@ -166,16 +239,7 @@ class BLUEPRINT_OT_generate(Operator):
 
         lines = []
         try:
-            report = core.generate(
-                use_current_scene=s.use_current_scene,
-                source=(None if s.use_current_scene else bpy.path.abspath(s.source)),
-                out_dir=bpy.path.abspath(s.out_dir),
-                views=views, unit=s.unit, page=s.page,
-                margin=s.margin, crease=s.crease,
-                hidden=s.hidden, dims=s.dims, png=s.png,
-                title=(s.title or None),
-                log=lines.append,
-            )
+            report = core.generate(log=lines.append, **_opts(s, views))
         except Exception as e:
             traceback.print_exc()
             self.report({"ERROR"}, str(e))
@@ -187,9 +251,52 @@ class BLUEPRINT_OT_generate(Operator):
         d = report["scene"]["dimensions"]
         s.last_output = report["output_dir"]
         s.last_result = "%s x %s x %s %s" % (
-            core.fmt(d["x"], s.unit), core.fmt(d["y"], s.unit),
-            core.fmt(d["z"], s.unit), s.unit)
-        self.report({"INFO"}, "%d views -> %s" % (len(views), report["output_dir"]))
+            render.fmt(d["x"], s.unit), render.fmt(d["y"], s.unit),
+            render.fmt(d["z"], s.unit), s.unit)
+        self.report({"INFO"}, "%d view%s -> %s"
+                    % (len(views), "" if len(views) == 1 else "s", report["output_dir"]))
+        return {"FINISHED"}
+
+
+class BLUEPRINT_OT_preview_refresh(Operator):
+    bl_idname = "blueprint.preview_refresh"
+    bl_label = "Refresh Preview"
+    bl_description = ("Rebuild the previewed view. Not automatic: rebuilding bakes Line "
+                      "Art, which is far too heavy to run on every viewport redraw")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        s = context.scene.blueprint
+        if s.use_current_scene and not core.mesh_objects(context.scene):
+            self.report({"ERROR"}, "No mesh geometry in the scene")
+            return {"CANCELLED"}
+        sheets = {}
+        try:
+            # write=False: a preview should not litter the output folder
+            core.generate(sheets_out=sheets, write=False, log=lambda *a: None,
+                          **_opts(s, [s.preview_view]))
+        except Exception as e:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        sheet = sheets.get(s.preview_view)
+        if sheet is None:
+            self.report({"ERROR"}, "Preview produced nothing")
+            return {"CANCELLED"}
+        preview.set_sheet(sheet, s.preview_view)
+        if not preview.is_enabled():
+            preview.enable()
+        return {"FINISHED"}
+
+
+class BLUEPRINT_OT_preview_toggle(Operator):
+    bl_idname = "blueprint.preview_toggle"
+    bl_label = "Show Preview"
+    bl_description = "Show or hide the blueprint overlay in the viewport"
+
+    def execute(self, context):
+        on = preview.toggle()
+        self.report({"INFO"}, "Preview " + ("on" if on else "off"))
         return {"FINISHED"}
 
 
@@ -220,11 +327,8 @@ class BLUEPRINT_OT_set_views(Operator):
 
     def execute(self, context):
         s = context.scene.blueprint
-        groups = {
-            "standard": ("front", "right", "top", "iso"),
-            "all": tuple(core.VIEW_ORDER),
-            "none": (),
-        }
+        groups = {"standard": ("front", "right", "top", "iso"),
+                  "all": tuple(core.VIEW_ORDER), "none": ()}
         chosen = groups.get(self.preset, groups["standard"])
         for v in core.VIEW_ORDER:
             setattr(s, "view_" + v, v in chosen)
@@ -269,7 +373,6 @@ class BLUEPRINT_PT_main(Panel):
         head.operator(BLUEPRINT_OT_set_views.bl_idname, text="Std").preset = "standard"
         head.operator(BLUEPRINT_OT_set_views.bl_idname, text="All").preset = "all"
         head.operator(BLUEPRINT_OT_set_views.bl_idname, text="None").preset = "none"
-
         grid = layout.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
         for v in core.VIEW_ORDER:
             grid.prop(s, "view_" + v, toggle=True)
@@ -278,6 +381,8 @@ class BLUEPRINT_PT_main(Panel):
         col = layout.column(align=True)
         col.prop(s, "unit")
         col.prop(s, "page")
+        col.prop(s, "theme")
+        col.prop(s, "layout")
 
         col = layout.column(align=True)
         col.prop(s, "margin", slider=True)
@@ -285,7 +390,11 @@ class BLUEPRINT_PT_main(Panel):
 
         row = layout.row(align=True)
         row.prop(s, "hidden", toggle=True)
+        row.prop(s, "silhouette", toggle=True)
+        row.prop(s, "grid", toggle=True)
+        row = layout.row(align=True)
         row.prop(s, "dims", toggle=True)
+        row.prop(s, "pdf", toggle=True)
         row.prop(s, "png", toggle=True)
 
         layout.separator()
@@ -294,7 +403,8 @@ class BLUEPRINT_PT_main(Panel):
         big.scale_y = 1.5
         big.enabled = n_views > 0
         big.operator(BLUEPRINT_OT_generate.bl_idname,
-                     text="Generate %d View%s" % (n_views, "" if n_views == 1 else "s"),
+                     text=("Generate Plate (%d views)" % n_views if s.layout == "plate"
+                           else "Generate %d View%s" % (n_views, "" if n_views == 1 else "s")),
                      icon="FILE_IMAGE")
 
         if s.last_result:
@@ -304,8 +414,76 @@ class BLUEPRINT_PT_main(Panel):
                 box.operator(BLUEPRINT_OT_open_output.bl_idname, icon="FILE_FOLDER")
 
 
+class BLUEPRINT_PT_dimensions(Panel):
+    bl_label = "Dimensions"
+    bl_idname = "BLUEPRINT_PT_dimensions"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Blueprint"
+    bl_parent_id = "BLUEPRINT_PT_main"
+
+    def draw(self, context):
+        s = context.scene.blueprint
+        layout = self.layout
+        layout.enabled = s.dims
+
+        col = layout.column(align=True)
+        col.label(text="Measure from:")
+        col.prop(s, "dim_overall", toggle=True)
+        col.prop(s, "dim_objects", toggle=True)
+        col.prop(s, "dim_edges", toggle=True)
+        col.prop(s, "dim_auto", toggle=True)
+        col.prop(s, "dim_empties", toggle=True)
+
+        obj = context.active_object
+        if s.dim_edges:
+            if obj and obj.mode == "EDIT":
+                layout.label(text="Reading live edge selection", icon="EDITMODE_HLT")
+            else:
+                layout.label(text="Uses the stored edge selection", icon="INFO")
+        if s.dim_auto or s.dim_edges:
+            layout.prop(s, "dim_radius_not_dia")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Kinds to draw:")
+        for k, lbl, _d in KIND_ITEMS:
+            col.prop(s, "kind_" + k, toggle=True)
+
+
+class BLUEPRINT_PT_preview(Panel):
+    bl_label = "Preview"
+    bl_idname = "BLUEPRINT_PT_preview"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Blueprint"
+    bl_parent_id = "BLUEPRINT_PT_main"
+
+    def draw(self, context):
+        s = context.scene.blueprint
+        layout = self.layout
+        st = preview.status()
+
+        layout.prop(s, "preview_view", text="")
+        row = layout.row(align=True)
+        row.operator(BLUEPRINT_OT_preview_refresh.bl_idname, icon="FILE_REFRESH")
+        row.operator(BLUEPRINT_OT_preview_toggle.bl_idname,
+                     text="", icon="HIDE_OFF" if preview.is_enabled() else "HIDE_ON",
+                     depress=preview.is_enabled())
+
+        if not st["has"]:
+            layout.label(text="Nothing previewed yet", icon="INFO")
+        elif st["stale"]:
+            layout.label(text="Options changed - refresh", icon="ERROR")
+        else:
+            layout.label(text="Showing %s" % st["view"].upper(), icon="CHECKMARK")
+        layout.label(text="Hidden lines show translucent, not dashed")
+
+
 CLASSES = (BlueprintSettings, BLUEPRINT_OT_import, BLUEPRINT_OT_generate,
-           BLUEPRINT_OT_open_output, BLUEPRINT_OT_set_views, BLUEPRINT_PT_main)
+           BLUEPRINT_OT_preview_refresh, BLUEPRINT_OT_preview_toggle,
+           BLUEPRINT_OT_open_output, BLUEPRINT_OT_set_views,
+           BLUEPRINT_PT_main, BLUEPRINT_PT_dimensions, BLUEPRINT_PT_preview)
 
 
 def register():
@@ -315,6 +493,7 @@ def register():
 
 
 def unregister():
+    preview.disable()      # a live draw handler would outlive the add-on and crash
     del bpy.types.Scene.blueprint
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)
