@@ -91,3 +91,10 @@ Caveats, also emitted into `dimensions.json`:
   box than its true size — use that object's `local_dimensions` instead.
 - Line Art follows the mesh, so a tessellated curve reads as facets.
 - The stated scale assumes the SVG is printed at its declared physical page size.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Blender itself is GPL, but this is a script *run by* Blender rather than a derivative of
+it, and its output is your own data. Nothing here redistributes Blender.
