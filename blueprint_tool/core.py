@@ -1,32 +1,28 @@
-#!/usr/bin/env python3
 """
-blueprint.py — headless Blender: 3D model in, dimensions + orthographic blueprint views out.
+Core of blueprint-tool: 3D model -> dimensions + orthographic blueprint drawings.
 
-    blender -b --python blueprint.py -- --input model.fbx --out ./out
+Imported by both the CLI (`cli.py`, run through `blender -b --python`) and the Blender
+add-on (`__init__.py`). Everything here is plain functions over bpy — nothing registers.
 
-Accepts .blend .fbx .obj .glb/.gltf .stl .ply .usd*
-Emits dimensions.json plus, per view, a print-scaled SVG (vector, hidden-line removed,
-dimensioned, with a title block) and optionally a shaded PNG reference.
+The single entry point is `generate(**options)`; see DEFAULTS for the option set.
 
-Line Art gives the linework; the SVG is written here rather than by Blender's Grease
-Pencil exporter, whose output coordinates are degenerate on 5.0. Writing it locally also
-means the world->pixel mapping is ours, so dimension annotations land exactly.
+Line Art gives the linework. The SVG is written here rather than by Blender's Grease
+Pencil exporter, whose output coordinates are degenerate on 5.0 — and writing it locally
+means the world->pixel mapping is ours, so annotations land exactly.
 """
 
-import argparse
 import datetime
 import json
 import math
 import os
-import sys
 
 import bpy
 from mathutils import Vector
 from bpy_extras.object_utils import world_to_camera_view
 
-# ---------------------------------------------------------------- view definitions
+# ---------------------------------------------------------------- constants
 # Blender is Z-up. Each view records which world axis maps to screen right / up so the
-# projection stays explicit. `out` is the direction from the model toward the camera.
+# projection stays explicit. `out` points from the model toward the camera.
 VIEWS = {
     "front":  dict(rot=(90.0,   0.0,   0.0), right=(1, 0, 0),  up=(0, 0, 1),  out=(0, -1, 0)),
     "back":   dict(rot=(90.0,   0.0, 180.0), right=(-1, 0, 0), up=(0, 0, 1),  out=(0, 1, 0)),
@@ -37,41 +33,40 @@ VIEWS = {
     # true isometric: atan(1/sqrt(2)) elevation, 45 deg azimuth. Pictorial, not dimensioned.
     "iso":    dict(rot=(54.736, 0.0,  45.0), right=None,       up=None,       out=None),
 }
+VIEW_ORDER = ["front", "back", "left", "right", "top", "bottom", "iso"]
 AXIS_LABEL = {(1, 0, 0): "X", (-1, 0, 0): "X", (0, 1, 0): "Y",
               (0, -1, 0): "Y", (0, 0, 1): "Z", (0, 0, -1): "Z"}
 
 UNIT_FACTORS = {"m": 1.0, "cm": 100.0, "mm": 1000.0, "in": 39.3700787402, "ft": 3.28083989501}
 
-# name -> (page_w_mm, page_h_mm, px_w, px_h)  — pixel sizes are 300 dpi
+# name -> (page_w_mm, page_h_mm, px_w, px_h); pixel sizes are 300 dpi
 PAGES = {
     "a4l": (297.0, 210.0, 3508, 2480), "a4p": (210.0, 297.0, 2480, 3508),
     "a3l": (420.0, 297.0, 4961, 3508), "a3p": (297.0, 420.0, 3508, 4961),
     "a2l": (594.0, 420.0, 7016, 4961),
 }
 
+IMPORTABLE = (".fbx", ".blend", ".obj", ".glb", ".gltf", ".stl", ".ply",
+              ".usd", ".usda", ".usdc", ".usdz")
+
 INK = "#1a2b4c"
 FAINT = "#8a97ad"
 
-
-def parse_args():
-    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    p = argparse.ArgumentParser(prog="blueprint.py")
-    p.add_argument("--input", required=True)
-    p.add_argument("--out", default="./blueprint_out")
-    p.add_argument("--views", default="front,right,top,iso",
-                   help="comma list from: " + ",".join(VIEWS))
-    p.add_argument("--unit", default="m", choices=list(UNIT_FACTORS))
-    p.add_argument("--page", default="a4l", choices=list(PAGES))
-    p.add_argument("--margin", type=float, default=0.18,
-                   help="fraction of the frame kept clear for dimensions and title block")
-    p.add_argument("--crease", type=float, default=140.0,
-                   help="crease angle threshold, degrees. Lower = more interior lines.")
-    p.add_argument("--hidden", action="store_true",
-                   help="also draw occluded edges as dashed lines")
-    p.add_argument("--no-dims", action="store_true", help="omit dimension annotations")
-    p.add_argument("--png", action="store_true", help="also render a shaded PNG per view")
-    p.add_argument("--title", default=None, help="title block name (defaults to filename)")
-    return p.parse_args(argv)
+DEFAULTS = dict(
+    source=None,            # path to import; ignored when use_current_scene is True
+    use_current_scene=False,
+    out_dir="./blueprint_out",
+    views=("front", "right", "top", "iso"),
+    unit="m",
+    page="a4l",
+    margin=0.18,
+    crease=140.0,
+    hidden=False,
+    dims=True,
+    png=False,
+    title=None,
+    log=print,
+)
 
 
 # ---------------------------------------------------------------- scene loading
@@ -82,8 +77,15 @@ def load(path):
         return "blend"
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_into_current(path)
+    return ext.lstrip(".")
+
+
+def import_into_current(path):
+    """Import a model into the scene as it stands. Used by the add-on's Import button."""
+    ext = os.path.splitext(path)[1].lower()
     if ext == ".fbx":
-        # new C++ importer (4.5+): applies the file's own UnitScaleFactor
+        # new C++ importer (4.5+) applies the file's own UnitScaleFactor
         bpy.ops.wm.fbx_import(filepath=path)
     elif ext == ".obj":
         bpy.ops.wm.obj_import(filepath=path)
@@ -95,17 +97,92 @@ def load(path):
         bpy.ops.wm.ply_import(filepath=path)
     elif ext in (".usd", ".usda", ".usdc", ".usdz"):
         bpy.ops.wm.usd_import(filepath=path)
+    elif ext == ".blend":
+        bpy.ops.wm.open_mainfile(filepath=path)
     else:
-        raise SystemExit("unsupported input extension: " + ext)
+        raise ValueError("unsupported input extension: " + ext)
     return ext.lstrip(".")
 
 
-def strip_scene():
-    doomed = [o for o in bpy.data.objects
-              if o.type in {"CAMERA", "LIGHT", "GREASEPENCIL", "GPENCIL"}]
-    for o in doomed:
-        bpy.data.objects.remove(o, do_unlink=True)
-    return len(doomed)
+def mesh_objects(scene=None):
+    scene = scene or bpy.context.scene
+    return [o for o in scene.objects
+            if o.type == "MESH" and o.data and len(o.data.polygons) > 0
+            and not o.name.startswith("BlueprintLineArt")]
+
+
+class SceneGuard:
+    """
+    Save and restore everything generate() touches, and delete anything it creates.
+
+    The CLI runs in a throwaway process and does not care. The add-on runs against a live
+    scene the user is working in, where leaving stray cameras, a changed frame range or a
+    swapped render engine behind would be its own bug.
+    """
+
+    def __init__(self, scene, active=True):
+        self.scene = scene
+        self.active = active
+        self.created = []
+
+    def track(self, obj):
+        self.created.append(obj)
+        return obj
+
+    def __enter__(self):
+        if not self.active:
+            return self
+        sc, r, sh = self.scene, self.scene.render, self.scene.display.shading
+        self.saved = dict(
+            camera=sc.camera,
+            frame_start=sc.frame_start, frame_end=sc.frame_end, frame_current=sc.frame_current,
+            engine=r.engine, res_x=r.resolution_x, res_y=r.resolution_y,
+            res_pct=r.resolution_percentage, filepath=r.filepath,
+            film_transparent=r.film_transparent,
+            file_format=r.image_settings.file_format, color_mode=r.image_settings.color_mode,
+            light=sh.light, color_type=sh.color_type, single_color=tuple(sh.single_color),
+            outline=sh.show_object_outline, outline_color=tuple(sh.object_outline_color),
+            world_color=tuple(sc.world.color) if sc.world else None,
+        )
+        return self
+
+    def __exit__(self, *exc):
+        for obj in reversed(self.created):
+            try:
+                data = getattr(obj, "data", None)
+                bpy.data.objects.remove(obj, do_unlink=True)
+                if data is not None and data.users == 0:
+                    for coll in (bpy.data.cameras, bpy.data.grease_pencils_v3
+                                 if hasattr(bpy.data, "grease_pencils_v3") else None):
+                        if coll is not None:
+                            try:
+                                coll.remove(data)
+                                break
+                            except (TypeError, RuntimeError):
+                                pass
+            except (ReferenceError, RuntimeError):
+                pass
+        self.created = []
+
+        if not self.active:
+            return False
+        sc, r, sh, s = self.scene, self.scene.render, self.scene.display.shading, self.saved
+        sc.camera = s["camera"]
+        sc.frame_start, sc.frame_end = s["frame_start"], s["frame_end"]
+        sc.frame_current = s["frame_current"]
+        r.engine = s["engine"]
+        r.resolution_x, r.resolution_y = s["res_x"], s["res_y"]
+        r.resolution_percentage, r.filepath = s["res_pct"], s["filepath"]
+        r.film_transparent = s["film_transparent"]
+        r.image_settings.file_format = s["file_format"]
+        r.image_settings.color_mode = s["color_mode"]
+        sh.light, sh.color_type = s["light"], s["color_type"]
+        sh.single_color = s["single_color"]
+        sh.show_object_outline = s["outline"]
+        sh.object_outline_color = s["outline_color"]
+        if s["world_color"] is not None and sc.world:
+            sc.world.color = s["world_color"]
+        return False
 
 
 # ---------------------------------------------------------------- measurement
@@ -166,18 +243,20 @@ def measure(objs, factor, nd=4):
 
 
 # ---------------------------------------------------------------- camera
-def make_camera(name, spec, mn, mx, res_x, res_y, margin):
+def make_camera(name, spec, mn, mx, res_x, res_y, margin, guard=None):
     cd = bpy.data.cameras.new(name)
     cd.type = "ORTHO"
-    # HORIZONTAL fit fixes the meaning of ortho_scale to "world units across the image
-    # width" whatever the aspect. AUTO would flip that meaning on a portrait page.
+    # HORIZONTAL fit fixes ortho_scale to mean "world units across the image width"
+    # whatever the aspect. AUTO would flip that meaning on a portrait page.
     cd.sensor_fit = "HORIZONTAL"
 
     cam = bpy.data.objects.new(name, cd)
     bpy.context.scene.collection.objects.link(cam)
+    if guard is not None:
+        guard.track(cam)
     cam.rotation_euler = tuple(math.radians(a) for a in spec["rot"])
-    # matrix_world is stale until the depsgraph runs; the iso view derives its axes from
-    # it, and reading it early yields the identity matrix and an empty render.
+    # matrix_world is stale until the depsgraph runs. The iso view derives its axes from
+    # it; reading it early yields the identity matrix and an empty drawing.
     bpy.context.view_layer.update()
 
     centre = (mn + mx) / 2.0
@@ -224,13 +303,15 @@ def make_camera(name, spec, mn, mx, res_x, res_y, margin):
 
 
 # ---------------------------------------------------------------- line art
-def make_lineart(crease_deg):
+def make_lineart(crease_deg, guard=None):
     bpy.ops.object.grease_pencil_add(type="LINEART_SCENE", align="WORLD", location=(0, 0, 0))
     gp = bpy.context.object
     gp.name = "BlueprintLineArt"
+    if guard is not None:
+        guard.track(gp)
     mod = next((m for m in gp.modifiers if m.type == "LINEART"), None)
     if mod is None:
-        raise SystemExit("Line Art modifier was not created")
+        raise RuntimeError("Line Art modifier was not created")
 
     for k, v in (("use_contour", True), ("use_crease", True), ("use_material", True),
                  ("use_intersection", True), ("use_edge_mark", True), ("use_loose", False),
@@ -275,11 +356,10 @@ def read_strokes(gp, scene, cam, res_x, res_y):
         offsets = [o.value for o in drawing.curve_offsets]
         cyclic_attr = drawing.attributes.get("cyclic")
         cyclic = [c.value for c in cyclic_attr.data] if cyclic_attr else []
-        pts = [Vector(p.vector) for p in pos.data]
 
         projected = []
-        for p in pts:
-            n = world_to_camera_view(scene, cam, mw @ p)
+        for p in pos.data:
+            n = world_to_camera_view(scene, cam, mw @ Vector(p.vector))
             projected.append((n.x * res_x, (1.0 - n.y) * res_y))
 
         for i in range(len(offsets) - 1):
@@ -317,16 +397,14 @@ def dim_group(bbox_px, w_val, h_val, unit, w_lbl, h_lbl, fs, pad):
     x0, y0, x1, y1 = bbox_px
     g = ['<g id="dimensions" fill="%s" stroke="%s" stroke-width="2" '
          'font-family="Helvetica,Arial,sans-serif" font-size="%.0f">' % (INK, INK, fs)]
-    ah = fs * 0.42  # arrow half-length
+    ah = fs * 0.42
 
     def arrow(x, y, dx, dy):
-        # filled triangle pointing along (dx, dy)
         px, py = -dy, dx
         return ('<polygon points="%.1f,%.1f %.1f,%.1f %.1f,%.1f" stroke="none"/>'
                 % (x, y, x - dx * ah * 2 + px * ah * 0.5, y - dy * ah * 2 + py * ah * 0.5,
                    x - dx * ah * 2 - px * ah * 0.5, y - dy * ah * 2 - py * ah * 0.5))
 
-    # ---- horizontal
     dy = y1 + pad
     g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
              % (x0, y1, x0, dy + fs * 0.6, FAINT))
@@ -344,7 +422,6 @@ def dim_group(bbox_px, w_val, h_val, unit, w_lbl, h_lbl, fs, pad):
                  'font-size="%.0f">%s</text>'
                  % ((x0 + x1) / 2, dy + fs * 1.5, FAINT, fs * 0.72, w_lbl))
 
-    # ---- vertical
     dx = x0 - pad
     g.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
              % (x0, y0, dx - fs * 0.6, y0, FAINT))
@@ -413,12 +490,10 @@ def write_svg(path, page, polylines, hidden_lines, bbox_px, dims, meta):
                      'stroke-dasharray="14 10" stroke-linecap="round">' % FAINT)
         parts += ['<path d="%s"/>' % path_d(p) for p in hidden_lines]
         parts.append("</g>")
-
     parts.append('<g id="linework" fill="none" stroke="%s" stroke-width="3.2" '
                  'stroke-linecap="round" stroke-linejoin="round">' % INK)
     parts += ['<path d="%s"/>' % path_d(p) for p in polylines]
     parts.append("</g>")
-
     if dims:
         parts.append(dim_group(bbox_px, dims["w"], dims["h"], dims["unit"],
                                dims["w_label"], dims["h_label"], fs, fs * 3.0))
@@ -429,149 +504,169 @@ def write_svg(path, page, polylines, hidden_lines, bbox_px, dims, meta):
 
 
 # ---------------------------------------------------------------- png
-def setup_render(px_w, px_h):
-    sc = bpy.context.scene
-    r = sc.render
+def setup_render(scene, px_w, px_h):
+    r = scene.render
     r.resolution_x, r.resolution_y, r.resolution_percentage = px_w, px_h, 100
     r.film_transparent = False
     r.image_settings.file_format = "PNG"
     r.image_settings.color_mode = "RGB"
-    sc.render.engine = "BLENDER_WORKBENCH"
-    sh = sc.display.shading
+    r.engine = "BLENDER_WORKBENCH"
+    sh = scene.display.shading
     sh.light = "STUDIO"          # FLAT + white single colour renders white-on-white
     sh.color_type = "SINGLE"
     sh.single_color = (0.62, 0.66, 0.72)
     sh.show_object_outline = True
     sh.object_outline_color = (0.1, 0.17, 0.30)
-    if sc.world is None:
-        sc.world = bpy.data.worlds.new("W")
-    sc.world.color = (1.0, 1.0, 1.0)
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("W")
+    scene.world.color = (1.0, 1.0, 1.0)
 
 
-# ---------------------------------------------------------------- main
-def main():
-    a = parse_args()
-    src = os.path.abspath(a.input)
-    out_dir = os.path.abspath(a.out)
-    os.makedirs(out_dir, exist_ok=True)
-    page = PAGES[a.page]
-    mm_w, mm_h, px_w, px_h = page
-    views = [v.strip() for v in a.views.split(",") if v.strip()]
-    for v in views:
+# ---------------------------------------------------------------- entry point
+def generate(**kwargs):
+    """Produce drawings + dimensions.json. Returns the report dict."""
+    o = dict(DEFAULTS)
+    o.update(kwargs)
+    log = o["log"] or (lambda *a: None)
+
+    for v in o["views"]:
         if v not in VIEWS:
-            raise SystemExit("unknown view %r; choose from %s" % (v, ", ".join(VIEWS)))
+            raise ValueError("unknown view %r; choose from %s" % (v, ", ".join(VIEW_ORDER)))
+    if not o["views"]:
+        raise ValueError("no views selected")
+    if o["unit"] not in UNIT_FACTORS:
+        raise ValueError("unknown unit " + str(o["unit"]))
+    if o["page"] not in PAGES:
+        raise ValueError("unknown page " + str(o["page"]))
 
-    kind = load(src)
+    out_dir = os.path.abspath(bpy.path.abspath(o["out_dir"]))
+    os.makedirs(out_dir, exist_ok=True)
+    page = PAGES[o["page"]]
+    mm_w, mm_h, px_w, px_h = page
+
+    if o["use_current_scene"]:
+        src = bpy.data.filepath or "<current scene>"
+        kind = "scene"
+    else:
+        if not o["source"]:
+            raise ValueError("no source file given")
+        src = os.path.abspath(bpy.path.abspath(o["source"]))
+        if not os.path.exists(src):
+            raise ValueError("input not found: " + src)
+        kind = load(src)
+
     scene = bpy.context.scene
     u = scene.unit_settings
     # Blender stores geometry in metres; scale_length is a display setting.
-    factor = UNIT_FACTORS[a.unit] * (u.scale_length if u.system != "NONE" else 1.0)
+    factor = UNIT_FACTORS[o["unit"]] * (u.scale_length if u.system != "NONE" else 1.0)
 
-    removed = strip_scene()
-    objs = [o for o in scene.objects if o.type == "MESH" and len(o.data.polygons) > 0]
+    objs = mesh_objects(scene)
     if not objs:
-        raise SystemExit("no mesh geometry found in " + src)
-    print("[scene] %s (%s): %d meshes, stripped %d camera/light/GP objects"
-          % (os.path.basename(src), kind, len(objs), removed))
+        raise ValueError("no mesh geometry found in " + src)
+    log("[scene] %s (%s): %d meshes" % (os.path.basename(src), kind, len(objs)))
 
     scene_dims, per_object, mn, mx = measure(objs, factor)
-    # Line Art bakes every frame in the scene range; pin it to one or a 250-frame file
-    # bakes 250 times per view.
-    scene.frame_start = scene.frame_end = scene.frame_current = 1
-    setup_render(px_w, px_h)
-    gp, mod = make_lineart(a.crease)
-
-    title = a.title or os.path.splitext(os.path.basename(src))[0]
+    title = o["title"] or (os.path.splitext(os.path.basename(src))[0]
+                           if src != "<current scene>" else "Untitled")
     d = scene_dims["dimensions"]
     views_meta = {}
 
-    for name in views:
-        cam, mapping = make_camera("cam_" + name, VIEWS[name], mn, mx, px_w, px_h, a.margin)
-        scene.camera = cam
-        bpy.context.view_layer.update()
+    # Restore the user's scene afterwards when running inside the GUI; the CLI is a
+    # throwaway process and skips the bookkeeping.
+    with SceneGuard(scene, active=o["use_current_scene"]) as guard:
+        # Line Art bakes the whole scene frame range; pin it or a 250-frame file bakes
+        # 250 times per view.
+        scene.frame_start = scene.frame_end = scene.frame_current = 1
+        setup_render(scene, px_w, px_h)
+        gp, mod = make_lineart(o["crease"], guard)
 
-        if hasattr(mod, "use_multiple_levels"):
-            mod.use_multiple_levels = False
-        bake_strokes(gp)
-        visible = read_strokes(gp, scene, cam, px_w, px_h)
+        for name in o["views"]:
+            cam, mapping = make_camera("bp_cam_" + name, VIEWS[name], mn, mx,
+                                       px_w, px_h, o["margin"], guard)
+            scene.camera = cam
+            bpy.context.view_layer.update()
 
-        hidden = []
-        if a.hidden and hasattr(mod, "use_multiple_levels"):
-            mod.use_multiple_levels = True
-            mod.level_start, mod.level_end = 1, 3
+            if hasattr(mod, "use_multiple_levels"):
+                mod.use_multiple_levels = False
             bake_strokes(gp)
-            hidden = read_strokes(gp, scene, cam, px_w, px_h)
-            mod.use_multiple_levels = False
+            visible = read_strokes(gp, scene, cam, px_w, px_h)
 
-        # dimension the projected model bbox, not the linework extents
-        corners = [Vector((x, y, z)) for x in (mn.x, mx.x)
-                   for y in (mn.y, mx.y) for z in (mn.z, mx.z)]
-        proj = [world_to_camera_view(scene, cam, c) for c in corners]
-        bx = [p.x * px_w for p in proj]
-        by = [(1 - p.y) * px_h for p in proj]
-        bbox_px = (min(bx), min(by), max(bx), max(by))
+            hidden = []
+            if o["hidden"] and hasattr(mod, "use_multiple_levels"):
+                mod.use_multiple_levels = True
+                mod.level_start, mod.level_end = 1, 3
+                bake_strokes(gp)
+                hidden = read_strokes(gp, scene, cam, px_w, px_h)
+                mod.use_multiple_levels = False
 
-        right = Vector(mapping["screen_right_axis"])
-        up = Vector(mapping["screen_up_axis"])
-        span = mx - mn
-        w_world = abs(span.dot(right)) * factor
-        h_world = abs(span.dot(up)) * factor
-        # drawing scale: how much of the page one world unit occupies
-        scale_ratio = (mm_w / 1000.0) / mapping["ortho_scale_world"]
+            # dimension the projected model bbox, not the linework extents
+            corners = [Vector((x, y, z)) for x in (mn.x, mx.x)
+                       for y in (mn.y, mx.y) for z in (mn.z, mx.z)]
+            proj = [world_to_camera_view(scene, cam, c) for c in corners]
+            bx = [p.x * px_w for p in proj]
+            by = [(1 - p.y) * px_h for p in proj]
+            bbox_px = (min(bx), min(by), max(bx), max(by))
 
-        dims = None if (a.no_dims or name == "iso") else {
-            "w": w_world, "h": h_world, "unit": a.unit,
-            "w_label": mapping["screen_right_label"], "h_label": mapping["screen_up_label"],
-        }
-        meta_rows = [
-            ("", title),
-            ("View", name.upper()),
-            ("Overall", "%s x %s x %s %s" % (fmt(d["x"], a.unit), fmt(d["y"], a.unit),
-                                             fmt(d["z"], a.unit), a.unit)),
-            ("Scale", "1:%.1f" % (1.0 / scale_ratio) if scale_ratio < 1 else
-                      "%.1f:1" % scale_ratio),
-            ("Page", "%s (%gx%g mm)" % (a.page.upper(), mm_w, mm_h)),
-            ("Date", datetime.date.today().isoformat()),
-        ]
+            right, up = Vector(mapping["screen_right_axis"]), Vector(mapping["screen_up_axis"])
+            span = mx - mn
+            w_world = abs(span.dot(right)) * factor
+            h_world = abs(span.dot(up)) * factor
+            scale_ratio = (mm_w / 1000.0) / mapping["ortho_scale_world"]
+            scale_text = ("1:%.1f" % (1.0 / scale_ratio)) if scale_ratio < 1 \
+                else ("%.1f:1" % scale_ratio)
 
-        svg_path = os.path.join(out_dir, name + ".svg")
-        write_svg(svg_path, page, visible, hidden, bbox_px, dims, meta_rows)
+            dims = None if (not o["dims"] or name == "iso") else {
+                "w": w_world, "h": h_world, "unit": o["unit"],
+                "w_label": mapping["screen_right_label"],
+                "h_label": mapping["screen_up_label"],
+            }
+            meta_rows = [
+                ("", title),
+                ("View", name.upper()),
+                ("Overall", "%s x %s x %s %s" % (fmt(d["x"], o["unit"]), fmt(d["y"], o["unit"]),
+                                                 fmt(d["z"], o["unit"]), o["unit"])),
+                ("Scale", scale_text),
+                ("Page", "%s (%gx%g mm)" % (o["page"].upper(), mm_w, mm_h)),
+                ("Date", datetime.date.today().isoformat()),
+            ]
 
-        mapping.update({
-            "svg": os.path.basename(svg_path),
-            "stroke_count": len(visible),
-            "hidden_stroke_count": len(hidden),
-            "page_mm": [mm_w, mm_h],
-            "drawing_scale": round(scale_ratio, 6),
-            "drawing_scale_text": meta_rows[3][1],
-            "model_bbox_pixels": [round(v, 2) for v in bbox_px],
-            "dimensioned_width_" + a.unit: round(w_world, 4),
-            "dimensioned_height_" + a.unit: round(h_world, 4),
-        })
+            svg_path = os.path.join(out_dir, name + ".svg")
+            write_svg(svg_path, page, visible, hidden, bbox_px, dims, meta_rows)
 
-        if a.png:
-            gp.hide_render = True
-            png_path = os.path.join(out_dir, name + ".png")
-            scene.render.filepath = png_path
-            bpy.ops.render.render(write_still=True)
-            gp.hide_render = False
-            mapping["png"] = os.path.basename(png_path)
+            mapping.update({
+                "svg": os.path.basename(svg_path),
+                "stroke_count": len(visible), "hidden_stroke_count": len(hidden),
+                "page_mm": [mm_w, mm_h],
+                "drawing_scale": round(scale_ratio, 6), "drawing_scale_text": scale_text,
+                "model_bbox_pixels": [round(v, 2) for v in bbox_px],
+                "dimensioned_width_" + o["unit"]: round(w_world, 4),
+                "dimensioned_height_" + o["unit"]: round(h_world, 4),
+            })
 
-        views_meta[name] = mapping
-        print("[view] %-7s %4d strokes%s  scale %s  -> %s"
-              % (name, len(visible),
-                 (" +%d hidden" % len(hidden)) if hidden else "",
-                 mapping["drawing_scale_text"], mapping["svg"]))
+            if o["png"]:
+                gp.hide_render = True
+                png_path = os.path.join(out_dir, name + ".png")
+                scene.render.filepath = png_path
+                bpy.ops.render.render(write_still=True)
+                gp.hide_render = False
+                mapping["png"] = os.path.basename(png_path)
+
+            views_meta[name] = mapping
+            log("[view] %-7s %4d strokes%s  scale %s  -> %s"
+                % (name, len(visible), (" +%d hidden" % len(hidden)) if hidden else "",
+                   scale_text, mapping["svg"]))
 
     report = {
         "source": src, "source_type": kind,
+        "title": title,
         "blender_version": bpy.app.version_string,
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "units": {"system": u.system, "length_unit": u.length_unit,
-                  "scale_length": u.scale_length, "reported_in": a.unit,
+                  "scale_length": u.scale_length, "reported_in": o["unit"],
                   "note": "Blender stores geometry in metres; reported values are "
                           "metres * scale_length * unit factor."},
         "scene": scene_dims, "objects": per_object, "views": views_meta,
+        "output_dir": out_dir,
         "caveats": [
             "Dimensions are axis-aligned bounding boxes. A part rotated off-axis reports a "
             "larger box than its true size; use local_dimensions for that part.",
@@ -579,17 +674,13 @@ def main():
             "Scale assumes the SVG is printed at its declared physical page size.",
         ],
     }
-    json_path = os.path.join(out_dir, "dimensions.json")
-    with open(json_path, "w") as f:
+    with open(os.path.join(out_dir, "dimensions.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    print("\n=== %s ===" % title)
-    print("  overall  %s x %s x %s %s   (X x Y x Z)"
-          % (fmt(d["x"], a.unit), fmt(d["y"], a.unit), fmt(d["z"], a.unit), a.unit))
-    print("  meshes   %d   polygons %d   vertices %d"
-          % (scene_dims["mesh_count"], scene_dims["polygon_count"], scene_dims["vertex_count"]))
-    print("  output   %s" % out_dir)
-
-
-if __name__ == "__main__":
-    main()
+    log("\n=== %s ===" % title)
+    log("  overall  %s x %s x %s %s   (X x Y x Z)"
+        % (fmt(d["x"], o["unit"]), fmt(d["y"], o["unit"]), fmt(d["z"], o["unit"]), o["unit"]))
+    log("  meshes   %d   polygons %d   vertices %d"
+        % (scene_dims["mesh_count"], scene_dims["polygon_count"], scene_dims["vertex_count"]))
+    log("  output   %s" % out_dir)
+    return report
