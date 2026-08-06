@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# bp — convenience wrapper around blueprint.py
+#
+#   ./bp model.fbx                          -> ./blueprint_out, 4 views, metres, A4 landscape
+#   ./bp model.fbx --unit mm --page a3l --hidden --png
+#
+# Override the Blender binary with BLENDER=/path/to/Blender
+set -euo pipefail
+
+BLENDER="${BLENDER:-/Applications/Blender.app/Contents/MacOS/Blender}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ $# -lt 1 ]; then
+  echo "usage: bp <model.fbx|.blend|.obj|.glb|.stl|.ply|.usd> [blueprint.py options]" >&2
+  exit 2
+fi
+if [ ! -x "$BLENDER" ]; then
+  echo "Blender not found at $BLENDER — set BLENDER=/path/to/Blender" >&2
+  exit 2
+fi
+
+INPUT="$1"; shift
+# Blender prints its own banner on stdout; keep only our lines unless VERBOSE=1
+if [ "${VERBOSE:-0}" = "1" ]; then
+  exec "$BLENDER" -b --python "$HERE/blueprint.py" -- --input "$INPUT" "$@"
+else
+  "$BLENDER" -b --python "$HERE/blueprint.py" -- --input "$INPUT" "$@" \
+    | grep -E '^(\[|===|  )' || true
+fi

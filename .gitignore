@@ -1,0 +1,11 @@
+# generated output
+out/
+out_*/
+blueprint_out/
+
+# python
+__pycache__/
+*.py[cod]
+
+# macos
+.DS_Store
