@@ -17,6 +17,8 @@ drawings out — hidden-line removed, dimensioned, with a title block, as SVG an
 Press **N** in the 3D viewport and choose the **Blueprint** tab. Needs Blender 4.5 or
 newer; nothing else to install. Same on macOS and Windows.
 
+> This repository is private, so the release link needs a GitHub login with access to it.
+
 ## Using it
 
 1. Leave **Use Current Scene** ticked to draw what is already open — or untick it, pick a
@@ -153,8 +155,16 @@ Blender session. `--uninstall` removes it, `--list` shows the Blender installs f
 Windows.bat** for the same thing. `python3 build_addon.py` alone just writes the zip to
 `dist/`, reading the version straight out of `bl_info` so the two cannot drift.
 
-**Releasing:** tag `vX.Y.Z` matching `bl_info["version"]`, then attach
-`dist/blueprint_tool.zip` to the GitHub release.
+**Releasing:**
+
+```bash
+./release.sh 1.3.0
+```
+
+Bumps `bl_info`, builds, commits, tags, pushes and creates the GitHub release with the zip
+attached. The tag is derived from `bl_info` rather than typed twice, so the add-on version
+and the release tag cannot disagree. Omit the argument to release whatever version
+`bl_info` already declares.
 
 ### Module layout
 
