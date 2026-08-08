@@ -1,36 +1,23 @@
 # blueprint-tool
 
-3D model in → dimensions + orthographic blueprint drawings out. Runs on Blender, no other
-dependencies. Two front ends over one implementation:
-
-- **Blender add-on** — a panel in the 3D viewport sidebar. Same on macOS and Windows.
-- **Command line** — for batching, or driving it from another script.
-
-Both call `blueprint_tool/core.py`, so they cannot drift apart.
+A Blender add-on. Drop in a 3D model, get measured dimensions and orthographic blueprint
+drawings out — hidden-line removed, dimensioned, with a title block, as SVG and PDF.
 
 ![plate](docs/plate.png)
 
 *Four views on one A3 plate, cyanotype theme with the graticule on.*
 
-## Install the add-on
+## Install
 
-One command — it finds Blender, builds the zip, installs it, enables it, and confirms it
-survived into a fresh Blender session:
+1. Download **`blueprint_tool.zip`** from the
+   [latest release](https://github.com/divergentinc2021/blueprint-tool/releases/latest).
+2. In Blender: **Edit ▸ Preferences ▸ Add-ons ▸ ▾ ▸ Install from Disk…** and pick the zip.
+3. Tick it on.
 
-```bash
-python3 install_addon.py
-```
+Press **N** in the 3D viewport and choose the **Blueprint** tab. Needs Blender 4.5 or
+newer; nothing else to install. Same on macOS and Windows.
 
-Or double-click **Install on macOS.command** / **Install on Windows.bat**. Add
-`--uninstall` to remove it, `--list` to see which Blender installs were found, or set
-`BLENDER=/path/to/blender` to choose one.
-
-To install by hand instead: `python3 build_addon.py`, then in Blender
-**Edit ▸ Preferences ▸ Add-ons ▸ ▾ ▸ Install from Disk…** and pick the zip from `dist/`.
-
-Open the panel with **N** in the 3D viewport, then the **Blueprint** tab.
-
-### Using it
+## Using it
 
 1. Leave **Use Current Scene** ticked to draw what is already open — or untick it, pick a
    file, and press **Import Model**.
@@ -89,21 +76,6 @@ Placement keeps every label as a rectangle and pushes each new one further out u
 stops overlapping anything already placed, dimension lines included; a dimension that
 cannot find a clear spot is dropped rather than drawn over something else.
 
-## Command line
-
-```bash
-./bp model.fbx --out ./out --views front,right,top,iso --unit mm --page a3l --hidden
-```
-
-`bp` is a thin wrapper; the real invocation is:
-
-```bash
-blender -b --python cli.py -- --input model.fbx --out ./out --unit mm
-```
-
-Override the binary with `BLENDER=/path/to/blender ./bp …`, and see full Blender output
-with `VERBOSE=1 ./bp …`. On Windows, call `blender.exe -b --python cli.py -- …` directly.
-
 Accepts `.fbx .blend .obj .glb .gltf .stl .ply .usd*`.
 
 ## Output
@@ -134,6 +106,9 @@ See [`examples/`](examples/) for real output.
 | `--png` | PNG | off | shaded reference image per view |
 | `--title` | Title | filename | title block heading |
 
+The CLI flags exist because the same code also runs headless — see
+[Development](#development).
+
 ## How it works
 
 1. Import, then measure world axis-aligned bounding boxes, overall and per object.
@@ -152,7 +127,36 @@ x_px = world_to_camera_view(scene, cam, P).x * res_x
 y_px = (1 - world_to_camera_view(scene, cam, P).y) * res_y
 ```
 
-## Layout
+## Development
+
+Everything below is for working on the tool. Using it needs none of it.
+
+**Command line.** The same implementation runs headless, for batching:
+
+```bash
+./bp model.fbx --out ./out --views front,right,top,iso --unit mm --page a3l --hidden
+```
+
+`bp` wraps `blender -b --python cli.py -- --input model.fbx …`. Override the binary with
+`BLENDER=/path/to/blender`, and see full Blender output with `VERBOSE=1`. On Windows, call
+`blender.exe -b --python cli.py -- …` directly.
+
+**Build and install from source:**
+
+```bash
+python3 install_addon.py
+```
+
+Finds Blender, builds the zip, installs, enables, and confirms it survived into a fresh
+Blender session. `--uninstall` removes it, `--list` shows the Blender installs found, and
+`BLENDER=` picks one. Double-click **Install on macOS.command** / **Install on
+Windows.bat** for the same thing. `python3 build_addon.py` alone just writes the zip to
+`dist/`, reading the version straight out of `bl_info` so the two cannot drift.
+
+**Releasing:** tag `vX.Y.Z` matching `bl_info["version"]`, then attach
+`dist/blueprint_tool.zip` to the GitHub release.
+
+### Module layout
 
 ```
 blueprint_tool/__init__.py   add-on: properties, operators, panels
@@ -172,9 +176,8 @@ Sheet, so they cannot disagree about what the drawing contains. The PDF is emitt
 directly: Blender ships no PDF writer and reportlab is not available inside it, but a PDF
 of vector paths and base-14 text is small enough to write by hand.
 
-`build_addon.py` reads the version straight out of `bl_info`, so the zip name cannot drift
-from the add-on. After pulling changes, rebuild and reinstall — Blender copies the add-on
-into its own scripts folder, so the installed copy is a snapshot, not a live link.
+After pulling changes, rebuild and reinstall — Blender copies the add-on into its own
+scripts folder, so the installed copy is a snapshot, not a live link.
 
 ## Blender 5.0 notes (found the hard way)
 
