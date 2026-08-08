@@ -42,6 +42,12 @@ def parse_args():
                    help="blueprint/cyanotype = white lines on blue; sepia = parchment")
     p.add_argument("--plate", action="store_true",
                    help="lay every view out on ONE sheet instead of one page per view")
+    p.add_argument("--projection", action="store_true",
+                   help="ONE sheet, views aligned in standard multiview projection")
+    p.add_argument("--angle", default="third", choices=("third", "first"),
+                   help="projection convention: third angle (US) or first angle (ISO)")
+    p.add_argument("--no-uniform-scale", action="store_true",
+                   help="frame each view independently instead of sharing one scale")
     p.add_argument("--grid", action="store_true",
                    help="faint graticule behind the drawing")
     p.add_argument("--margin", type=float, default=0.18)
@@ -63,6 +69,16 @@ def parse_args():
                    help="auto-detect circular features and dimension them")
     p.add_argument("--dim-empties", action="store_true",
                    help="dimension between Empties, paired in name order")
+    p.add_argument("--dim-perimeter", action="store_true",
+                   help="perimeter of selected edge loops and selected faces")
+    p.add_argument("--only", default=None,
+                   help="comma list of object names to measure; others are ignored")
+    p.add_argument("--dim-offset", type=float, default=1.0,
+                   help="how far dimensions sit from the geometry (multiplier)")
+    p.add_argument("--dim-step", type=float, default=1.0,
+                   help="collision-avoidance stagger (multiplier)")
+    p.add_argument("--dim-text", type=float, default=1.0,
+                   help="dimension text size (multiplier)")
     p.add_argument("--no-overall", action="store_true",
                    help="omit the overall extents dimensions")
     p.add_argument("--radius", action="store_true",
@@ -81,13 +97,16 @@ def main():
             source=a.input, out_dir=a.out,
             views=[v.strip() for v in a.views.split(",") if v.strip()],
             unit=a.unit, page=a.page, theme=a.theme,
-            layout=("plate" if a.plate else "sheet"), grid=a.grid,
+            layout=("projection" if a.projection else ("plate" if a.plate else "sheet")),
+            angle=a.angle, uniform_scale=not a.no_uniform_scale, grid=a.grid,
             margin=a.margin, crease=a.crease,
             silhouette=not a.no_silhouette,
             hidden=a.hidden, dims=not a.no_dims, png=a.png, pdf=a.pdf, title=a.title,
             dim_overall=not a.no_overall, dim_objects=a.dim_objects,
             dim_edges=a.dim_edges, dim_auto=a.dim_auto, dim_empties=a.dim_empties,
-            dim_radius_not_dia=a.radius,
+            dim_radius_not_dia=a.radius, dim_perimeter=a.dim_perimeter,
+            dim_objects_only=([n.strip() for n in a.only.split(",")] if a.only else None),
+            dim_offset=a.dim_offset, dim_step=a.dim_step, dim_text=a.dim_text,
             dim_kinds=([k.strip() for k in a.kinds.split(",")] if a.kinds else None),
         )
     except ValueError as e:

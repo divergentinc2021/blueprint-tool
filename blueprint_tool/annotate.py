@@ -26,7 +26,7 @@ from mathutils import Vector
 
 from . import render
 
-KINDS = ("linear", "length", "diameter", "radius", "angle")
+KINDS = ("linear", "length", "diameter", "radius", "angle", "perimeter")
 
 
 class Dim:
@@ -258,6 +258,48 @@ def from_auto(objects, factor, unit, as_radius=False, tol=0.03, limit=12, min_ve
     return out[:limit]
 
 
+def from_perimeter(objects, factor, unit, use_selection=True, limit=12):
+    """
+    Perimeter of a closed loop of selected edges, and of each selected face.
+
+    Reported as a leader label at the loop centroid rather than a dimension line, because a
+    perimeter is a property of a shape, not a distance between two points.
+    """
+    out = []
+    for o in objects:
+        if o.type != "MESH":
+            continue
+        mw = o.matrix_world
+
+        if use_selection:
+            edges = _selected_edges(o)
+            if len(edges) >= 3:
+                total = sum((b - a).length for a, b, _ in edges)
+                pts = [p for a, b, _ in edges for p in (a, b)]
+                centre = sum(pts, Vector((0, 0, 0))) / len(pts)
+                out.append(Dim("perimeter", pts[0], centre, total,
+                               "P %s" % _label(total * factor, unit),
+                               "perimeter:%s:selection" % o.name, centre=centre,
+                               unit_value=total * factor))
+
+        # selected faces each get their own perimeter
+        me = o.data
+        if o.mode != "EDIT":
+            for poly in me.polygons:
+                if not poly.select:
+                    continue
+                vs = [mw @ me.vertices[i].co.copy() for i in poly.vertices]
+                total = sum((vs[i] - vs[i - 1]).length for i in range(len(vs)))
+                centre = sum(vs, Vector((0, 0, 0))) / len(vs)
+                out.append(Dim("perimeter", vs[0], centre, total,
+                               "P %s" % _label(total * factor, unit),
+                               "perimeter:%s:face%d" % (o.name, poly.index),
+                               centre=centre, unit_value=total * factor))
+                if len(out) >= limit:
+                    return out
+    return out[:limit]
+
+
 def from_empties(scene, factor, unit, limit=24):
     """Empties paired in name order: the 1st with the 2nd, the 3rd with the 4th, ..."""
     empties = sorted((o for o in scene.objects if o.type == "EMPTY"),
@@ -276,18 +318,31 @@ def from_empties(scene, factor, unit, limit=24):
 
 def collect(scene, objects, mn, mx, right, up, factor, unit, opts):
     """Gather dimensions from every enabled source."""
+    # An explicit include list beats "whatever happens to be selected": selection is easy
+    # to disturb, and a drawing should not change because someone clicked in the viewport.
+    only = opts.get("objects_only")
+    if only:
+        chosen = [ob for ob in objects if ob.name in set(only)]
+    else:
+        chosen = objects
+
     dims = []
     if opts.get("overall", True):
         dims += from_overall(mn, mx, right, up, factor, unit)
     if opts.get("objects"):
-        sel = [o for o in objects if o.select_get()] or objects
+        if only:
+            sel = chosen
+        else:
+            sel = [ob for ob in objects if ob.select_get()] or objects
         dims += from_objects(sel, factor, unit)
     if opts.get("edges"):
-        dims += from_edges(objects, factor, unit,
+        dims += from_edges(chosen, factor, unit,
                            want_angle=opts.get("angle", True),
                            want_circle=opts.get("circle", True))
     if opts.get("auto"):
-        dims += from_auto(objects, factor, unit, as_radius=opts.get("radius_not_dia", False))
+        dims += from_auto(chosen, factor, unit, as_radius=opts.get("radius_not_dia", False))
+    if opts.get("perimeter"):
+        dims += from_perimeter(chosen, factor, unit)
     if opts.get("empties"):
         dims += from_empties(scene, factor, unit)
 
@@ -338,14 +393,42 @@ def _project(scene, cam, p, px_w, px_h):
     return Vector((n.x * px_w, (1.0 - n.y) * px_h))
 
 
-def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px):
-    """Project and draw each dimension. Returns how many were drawn."""
+def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
+              offset=1.0, step=1.0):
+    """
+    Project and draw each dimension. Returns how many were drawn.
+
+    offset scales how far a dimension sits from the geometry, step scales the stagger used
+    when a position is already taken. Both are exposed because no automatic rule suits every
+    model: a dense mechanical part wants dimensions pushed well clear, a simple block wants
+    them tight.
+    """
     t = sheet.theme
     px_w, px_h = sheet.px_w, sheet.px_h
     drawn = 0
     ah = fs * 0.42
 
     for d in dims:
+        if d.kind == "perimeter":
+            # A perimeter belongs to a shape, not to a distance, so it gets a leader line
+            # out to a label rather than a dimension line with arrows.
+            c = _project(scene, cam, d.centre if d.centre else d.a, px_w, px_h)
+            bx0, by0, bx1, by1 = model_bbox_px
+            away = Vector((c.x - (bx0 + bx1) / 2.0, c.y - (by0 + by1) / 2.0))
+            away = away.normalized() if away.length > 1e-6 else Vector((1, -1)).normalized()
+            lw = render.text_width(d.label, fs) + fs * 0.7
+            lx, ly, ok = placer.place(c.x + away.x * fs * 3.0 * offset,
+                                      c.y + away.y * fs * 3.0 * offset,
+                                      lw, fs * 1.15, away.x, away.y, fs * 1.4 * step)
+            if not ok:
+                continue
+            sheet.polyline([(c.x, c.y), (lx - away.x * lw * 0.3, ly)], t["faint"], 1.8)
+            sheet.polyline([(c.x, c.y), (c.x, c.y)], t["ink"], 3.0)
+            render.label_plate(sheet, lx, ly, d.label, fs)
+            sheet.text(lx, ly + fs * 0.33, d.label, fs, t["ink"], anchor="middle")
+            drawn += 1
+            continue
+
         a = _project(scene, cam, d.a, px_w, px_h)
         b = _project(scene, cam, d.b, px_w, px_h)
         v = b - a
@@ -371,8 +454,9 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px):
             out = Vector((mid[0] - c.x, mid[1] - c.y))
             out = out.normalized() if out.length > 1e-6 else Vector((0, -1))
             lw = render.text_width(d.label, fs) + fs * 0.7
-            lx, ly, _ = placer.place(mid[0] + out.x * fs * 1.2, mid[1] + out.y * fs * 1.2,
-                                     lw, fs * 1.15, out.x, out.y, fs * 1.1)
+            lx, ly, _ = placer.place(mid[0] + out.x * fs * 1.2 * offset,
+                                     mid[1] + out.y * fs * 1.2 * offset,
+                                     lw, fs * 1.15, out.x, out.y, fs * 1.1 * step)
             render.label_plate(sheet, lx, ly, d.label, fs)
             sheet.text(lx, ly + fs * 0.33, d.label, fs, t["ink"], anchor="middle")
             drawn += 1
@@ -386,10 +470,10 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px):
         if (mid - bc).dot(n) < 0:     # always push away from the model, never across it
             n = -n
 
-        base = fs * 1.6
+        base = fs * 1.6 * offset
         lw = render.text_width(d.label, fs) + fs * 0.7
         lx, ly, ok = placer.place(mid.x + n.x * base, mid.y + n.y * base,
-                                  lw, fs * 1.15, n.x, n.y, fs * 1.35)
+                                  lw, fs * 1.15, n.x, n.y, fs * 1.35 * step)
         if not ok:
             continue
         off = Vector((lx, ly)) - mid

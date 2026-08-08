@@ -19,6 +19,16 @@ newer; nothing else to install. Same on macOS and Windows.
 
 > This repository is private, so the release link needs a GitHub login with access to it.
 
+**Updating is manual.** Blender copies the add-on into its own scripts folder, so the
+installed copy is a snapshot and a new release does not reach it. Download the new zip and
+Install from Disk again — it overwrites cleanly, no need to uninstall first.
+
+The panel has a **Check for Updates** button that compares the running version against a
+release feed and shows a banner when a newer one exists. It respects Blender's *Allow
+Online Access* policy (Preferences ▸ System), which is off by default, and it needs a feed
+it can read without credentials — against a private repository the GitHub API answers 404.
+Set the feed URL in the add-on preferences.
+
 ## Using it
 
 1. Leave **Use Current Scene** ticked to draw what is already open — or untick it, pick a
@@ -50,13 +60,26 @@ adds the faint graticule of real blueprint paper.
 
 ![themes](docs/themes.png)
 
-Two layouts. `sheet` (default) gives one page per view. `--plate` lays every view out on a
-single sheet, poster style, with one shared title block — the grid is chosen so the cells
-match the page proportions rather than leaving a hole.
+Three layouts:
+
+| Layout | Flag | What you get |
+|---|---|---|
+| Sheet | *(default)* | one page per view |
+| Plate | `--plate` | every view on one sheet, poster style, cells sized to match the page |
+| Projection | `--projection` | one sheet with the views **aligned in standard multiview projection** |
 
 ```bash
-./bp car.fbx --plate --theme cyanotype --grid --page a3l --pdf --title "MY CAR"
+./bp car.fbx --projection --page a3l --theme cyanotype --grid --pdf --title "MY CAR"
 ```
+
+Projection puts Top above Front and Right beside it (third angle, `--angle first` for the
+ISO convention), and the title block states which is in use — the two conventions mirror
+each other, so an unlabelled drawing is ambiguous.
+
+Multiview drawings share **one scale** across every view by default. Framing each view to
+its own extents makes the same model print at a different ratio per view, which stops the
+reader comparing them and makes the stated scale wrong on all but one. `--no-uniform-scale`
+turns that off.
 
 ## Dimensions
 
@@ -68,10 +91,23 @@ Dimension sources are independent and combine freely:
 | Selected objects | `--dim-objects` | each object's bounding box |
 | Selected edges | `--dim-edges` | length of every selected edge; two edges also give the angle between them; a selected circular loop gives its diameter |
 | Auto circles | `--dim-auto` | circular features found automatically, as diameter or `--radius` |
+| Perimeter | `--dim-perimeter` | around each selected face and closed loop of selected edges |
 | Empties | `--dim-empties` | between Empties, paired in name order |
 
-Kinds: `linear`, `length`, `diameter`, `radius`, `angle` — restrict with
+Kinds: `linear`, `length`, `diameter`, `radius`, `angle`, `perimeter` — restrict with
 `--kinds diameter,angle`.
+
+**Choosing what gets measured.** The **Objects** sub-panel lists every mesh in the scene
+with a tick box; untick anything that is not a real part and it is left out of every
+measurement. Refresh keeps the ticks you already set, so re-syncing after editing the scene
+does not quietly switch things back on. On the command line, `--only Chassis,Wheel` does the
+same. This matters more than it sounds: freshly added primitives arrive fully selected, so
+perimeter and edge sources otherwise produce a page of noise.
+
+**Spacing.** `--dim-offset` moves dimensions further from the geometry, `--dim-step`
+widens the stagger used when two dimensions collide, and `--dim-text` scales the text. No
+automatic rule suits every model — a dense mechanical part wants dimensions pushed well
+clear, a simple block wants them tight.
 
 Edge selection is read live in Edit Mode, and from the stored selection otherwise.
 Placement keeps every label as a rectangle and pushes each new one further out until it
@@ -174,6 +210,7 @@ blueprint_tool/core.py       scene loading, measuring, cameras, Line Art, orches
 blueprint_tool/render.py     Sheet primitives, themes, SVG and PDF backends
 blueprint_tool/annotate.py   dimension extraction and collision-aware placement
 blueprint_tool/preview.py    viewport GPU overlay
+blueprint_tool/updates.py    release-feed check
 cli.py                       command-line entry point
 bp                           shell wrapper around cli.py
 build_addon.py               zips blueprint_tool/ into dist/

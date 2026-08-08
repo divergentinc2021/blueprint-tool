@@ -11,7 +11,8 @@ the CLI cannot drift apart.
 bl_info = {
     "name": "Blueprint Tool",
     "author": "Laurent de Laroche Souvestre",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
+    "doc_url": "https://github.com/divergentinc2021/blueprint-tool",
     "blender": (4, 5, 0),
     "location": "3D Viewport > Sidebar (N) > Blueprint",
     "description": "Measure a model and generate dimensioned orthographic blueprint drawings",
@@ -22,11 +23,11 @@ import os
 import traceback
 
 import bpy
-from bpy.props import (BoolProperty, EnumProperty, FloatProperty, PointerProperty,
-                       StringProperty)
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty,
+                       IntProperty, PointerProperty, StringProperty)
+from bpy.types import Operator, Panel, PropertyGroup, UIList
 
-from . import annotate, core, preview, render
+from . import annotate, core, preview, render, updates
 
 if "bpy" in locals():  # support Reload Scripts
     import importlib
@@ -34,6 +35,7 @@ if "bpy" in locals():  # support Reload Scripts
     annotate = importlib.reload(annotate)
     core = importlib.reload(core)
     preview = importlib.reload(preview)
+    updates = importlib.reload(updates)
 
 
 UNIT_ITEMS = [
@@ -61,6 +63,12 @@ THEME_ITEMS = [
 LAYOUT_ITEMS = [
     ("sheet", "One Per Page", "A separate page for each view"),
     ("plate", "Single Plate", "Every view laid out on one sheet, poster style"),
+    ("projection", "Projection", "One sheet with the views aligned in standard "
+                                 "multiview projection"),
+]
+ANGLE_ITEMS = [
+    ("third", "Third Angle", "US convention: each view sits on the side it is seen from"),
+    ("first", "First Angle", "ISO/European convention: each view sits on the opposite side"),
 ]
 KIND_ITEMS = [
     ("linear", "Linear", "Width, height and depth extents"),
@@ -68,7 +76,43 @@ KIND_ITEMS = [
     ("diameter", "Diameter", "Across a circular feature"),
     ("radius", "Radius", "From the centre of a circular feature"),
     ("angle", "Angular", "Angle between two selected edges"),
+    ("perimeter", "Perimeter", "Around a selected face or closed edge loop"),
 ]
+
+
+class BlueprintObject(PropertyGroup):
+    """One row of the measured-objects list."""
+    name: StringProperty(name="Name")
+    use: BoolProperty(name="Measure", default=True, update=lambda s, c: preview.mark_stale())
+
+
+class BlueprintPrefs(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    feed_url: StringProperty(
+        name="Update Feed",
+        description="URL returning the latest release. A GitHub releases API URL or a "
+                    "plain JSON file with a \"version\" field both work",
+        default=updates.DEFAULT_FEED)
+    check_on_start: BoolProperty(
+        name="Check on Startup",
+        description="Check once when Blender loads the add-on",
+        default=False)
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "check_on_start")
+        col.prop(self, "feed_url")
+        if not getattr(bpy.app, "online_access", True):
+            col.label(text="Allow Online Access is off in Preferences > System",
+                      icon="ERROR")
+
+
+def _prefs():
+    try:
+        return bpy.context.preferences.addons[__name__].preferences
+    except (KeyError, AttributeError):
+        return None
 
 
 def _stale(self, context):
@@ -96,6 +140,12 @@ class BlueprintSettings(PropertyGroup):
     page: EnumProperty(name="Page", items=PAGE_ITEMS, default="a3l", update=_stale)
     theme: EnumProperty(name="Theme", items=THEME_ITEMS, default="white", update=_stale)
     layout: EnumProperty(name="Layout", items=LAYOUT_ITEMS, default="sheet", update=_stale)
+    angle: EnumProperty(name="Angle", items=ANGLE_ITEMS, default="third", update=_stale)
+    uniform_scale: BoolProperty(
+        name="Uniform Scale",
+        description="One scale across every view. Framing each view to its own extents "
+                    "makes the same model print at a different ratio per view",
+        default=True, update=_stale)
     grid: BoolProperty(
         name="Grid", description="Faint graticule behind the drawing, like blueprint paper",
         default=False, update=_stale)
@@ -150,9 +200,29 @@ class BlueprintSettings(PropertyGroup):
         description="Distance between Empties, paired in name order: 1st to 2nd, "
                     "3rd to 4th, and so on",
         default=False, update=_stale)
+    dim_perimeter: BoolProperty(
+        name="Perimeter",
+        description="Perimeter around each selected face and closed loop of selected edges",
+        default=False, update=_stale)
     dim_radius_not_dia: BoolProperty(
         name="Radius", description="Circular features as radius instead of diameter",
         default=False, update=_stale)
+    use_object_filter: BoolProperty(
+        name="Limit to Checked Objects",
+        description="Measure only the objects ticked below. Off measures everything",
+        default=False, update=_stale)
+    objects: CollectionProperty(type=BlueprintObject)
+    objects_index: IntProperty(default=0)
+
+    dim_offset: FloatProperty(
+        name="Offset", description="How far dimensions sit from the geometry",
+        default=1.0, min=0.2, max=6.0, update=_stale)
+    dim_step: FloatProperty(
+        name="Spread", description="How far apart dimensions are pushed when they collide",
+        default=1.0, min=0.2, max=6.0, update=_stale)
+    dim_text: FloatProperty(
+        name="Text Size", description="Dimension text size",
+        default=1.0, min=0.4, max=3.0, update=_stale)
 
     preview_view: EnumProperty(
         name="Preview",
@@ -183,11 +253,68 @@ def _opts(s, views):
         margin=s.margin, crease=s.crease, silhouette=s.silhouette,
         hidden=s.hidden, dims=s.dims, png=s.png, pdf=s.pdf,
         title=(s.title or None),
+        angle=s.angle, uniform_scale=s.uniform_scale,
         dim_overall=s.dim_overall, dim_objects=s.dim_objects, dim_edges=s.dim_edges,
-        dim_auto=s.dim_auto, dim_empties=s.dim_empties,
+        dim_auto=s.dim_auto, dim_empties=s.dim_empties, dim_perimeter=s.dim_perimeter,
         dim_radius_not_dia=s.dim_radius_not_dia,
+        dim_objects_only=([i.name for i in s.objects if i.use]
+                          if s.use_object_filter else None),
+        dim_offset=s.dim_offset, dim_step=s.dim_step, dim_text=s.dim_text,
         dim_kinds=(kinds if len(kinds) < len(KIND_ITEMS) else None),
     )
+
+
+# ---------------------------------------------------------------- object list
+class BLUEPRINT_UL_objects(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.prop(item, "use", text="")
+        obj = context.scene.objects.get(item.name)
+        row.label(text=item.name, icon="MESH_DATA" if obj else "ERROR")
+        if obj:
+            row.label(text="%d" % len(obj.data.polygons))
+
+
+class BLUEPRINT_OT_sync_objects(Operator):
+    bl_idname = "blueprint.sync_objects"
+    bl_label = "Refresh List"
+    bl_description = "Match the list to the mesh objects in the scene, keeping the ticks"
+
+    def execute(self, context):
+        s = context.scene.blueprint
+        # keep existing ticks so a refresh after editing the scene does not silently
+        # re-enable objects the user deliberately turned off
+        remembered = {i.name: i.use for i in s.objects}
+        s.objects.clear()
+        for o in core.mesh_objects(context.scene):
+            item = s.objects.add()
+            item.name = o.name
+            item.use = remembered.get(o.name, True)
+        preview.mark_stale()
+        self.report({"INFO"}, "%d object%s" % (len(s.objects),
+                                               "" if len(s.objects) == 1 else "s"))
+        return {"FINISHED"}
+
+
+class BLUEPRINT_OT_object_ticks(Operator):
+    bl_idname = "blueprint.object_ticks"
+    bl_label = "Set Ticks"
+    bl_description = "Tick all, none, or only what is selected in the viewport"
+
+    mode: StringProperty(default="all")
+
+    def execute(self, context):
+        s = context.scene.blueprint
+        selected = {o.name for o in context.selected_objects}
+        for item in s.objects:
+            if self.mode == "all":
+                item.use = True
+            elif self.mode == "none":
+                item.use = False
+            else:
+                item.use = item.name in selected
+        preview.mark_stale()
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------- operators
@@ -300,6 +427,34 @@ class BLUEPRINT_OT_preview_toggle(Operator):
         return {"FINISHED"}
 
 
+class BLUEPRINT_OT_check_updates(Operator):
+    bl_idname = "blueprint.check_updates"
+    bl_label = "Check for Updates"
+    bl_description = ("Ask whether a newer release exists. Installing is still a download "
+                      "and Install from Disk: Blender keeps its own copy of an add-on")
+
+    def execute(self, context):
+        p = _prefs()
+        started = updates.check_async(bl_info["version"],
+                                      feed_url=(p.feed_url if p else None),
+                                      on_done=preview.redraw)
+        if not started:
+            self.report({"WARNING"}, updates.state()["message"])
+        return {"FINISHED"}
+
+
+class BLUEPRINT_OT_open_url(Operator):
+    bl_idname = "blueprint.open_url"
+    bl_label = "Open"
+    bl_description = "Open this page in your browser"
+
+    url: StringProperty(default=updates.RELEASES_PAGE)
+
+    def execute(self, context):
+        bpy.ops.wm.url_open(url=self.url)
+        return {"FINISHED"}
+
+
 class BLUEPRINT_OT_open_output(Operator):
     bl_idname = "blueprint.open_output"
     bl_label = "Open Output Folder"
@@ -383,6 +538,10 @@ class BLUEPRINT_PT_main(Panel):
         col.prop(s, "page")
         col.prop(s, "theme")
         col.prop(s, "layout")
+        if s.layout == "projection":
+            col.prop(s, "angle")
+        if s.layout in ("plate", "projection"):
+            col.prop(s, "uniform_scale")
 
         col = layout.column(align=True)
         col.prop(s, "margin", slider=True)
@@ -403,7 +562,7 @@ class BLUEPRINT_PT_main(Panel):
         big.scale_y = 1.5
         big.enabled = n_views > 0
         big.operator(BLUEPRINT_OT_generate.bl_idname,
-                     text=("Generate Plate (%d views)" % n_views if s.layout == "plate"
+                     text=("Generate Sheet (%d views)" % n_views if s.layout != "sheet"
                            else "Generate %d View%s" % (n_views, "" if n_views == 1 else "s")),
                      icon="FILE_IMAGE")
 
@@ -412,6 +571,24 @@ class BLUEPRINT_PT_main(Panel):
             box.label(text=s.last_result, icon="DRIVER_DISTANCE")
             if s.last_output:
                 box.operator(BLUEPRINT_OT_open_output.bl_idname, icon="FILE_FOLDER")
+
+        st = updates.state()
+        v = bl_info["version"]
+        row = layout.row(align=True)
+        row.label(text="v%d.%d.%d" % v)
+        row.operator(BLUEPRINT_OT_check_updates.bl_idname, text="", icon="FILE_REFRESH")
+        if st["status"] == "newer":
+            box = layout.box()
+            box.alert = True
+            box.label(text="Update: %s" % st["message"], icon="IMPORT")
+            box.operator(BLUEPRINT_OT_open_url.bl_idname,
+                         text="Download", icon="URL").url = st["url"]
+            box.label(text="Then Preferences > Add-ons > Install from Disk")
+        elif st["status"] in ("error", "offline"):
+            layout.label(text=st["message"], icon="ERROR")
+        elif st["status"] in ("ok", "checking"):
+            layout.label(text=st["message"],
+                         icon="CHECKMARK" if st["status"] == "ok" else "SORTTIME")
 
 
 class BLUEPRINT_PT_dimensions(Panel):
@@ -433,6 +610,7 @@ class BLUEPRINT_PT_dimensions(Panel):
         col.prop(s, "dim_objects", toggle=True)
         col.prop(s, "dim_edges", toggle=True)
         col.prop(s, "dim_auto", toggle=True)
+        col.prop(s, "dim_perimeter", toggle=True)
         col.prop(s, "dim_empties", toggle=True)
 
         obj = context.active_object
@@ -449,6 +627,49 @@ class BLUEPRINT_PT_dimensions(Panel):
         col.label(text="Kinds to draw:")
         for k, lbl, _d in KIND_ITEMS:
             col.prop(s, "kind_" + k, toggle=True)
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Spacing:")
+        col.prop(s, "dim_offset", slider=True)
+        col.prop(s, "dim_step", slider=True)
+        col.prop(s, "dim_text", slider=True)
+
+
+class BLUEPRINT_PT_objects(Panel):
+    bl_label = "Objects"
+    bl_idname = "BLUEPRINT_PT_objects"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Blueprint"
+    bl_parent_id = "BLUEPRINT_PT_main"
+
+    def draw(self, context):
+        s = context.scene.blueprint
+        layout = self.layout
+        layout.prop(s, "use_object_filter")
+
+        box = layout.column()
+        box.enabled = s.use_object_filter
+        row = box.row(align=True)
+        row.operator(BLUEPRINT_OT_sync_objects.bl_idname, icon="FILE_REFRESH")
+        row = box.row(align=True)
+        row.operator(BLUEPRINT_OT_object_ticks.bl_idname, text="All").mode = "all"
+        row.operator(BLUEPRINT_OT_object_ticks.bl_idname, text="None").mode = "none"
+        row.operator(BLUEPRINT_OT_object_ticks.bl_idname,
+                     text="Selected").mode = "selected"
+
+        box.template_list("BLUEPRINT_UL_objects", "", s, "objects", s, "objects_index",
+                          rows=6)
+
+        n_scene = len(core.mesh_objects(context.scene))
+        n_on = sum(1 for i in s.objects if i.use)
+        if not len(s.objects):
+            box.label(text="Press Refresh to list the scene", icon="INFO")
+        elif len(s.objects) != n_scene:
+            box.label(text="Scene has %d meshes - refresh" % n_scene, icon="ERROR")
+        else:
+            box.label(text="Measuring %d of %d" % (n_on, n_scene), icon="CHECKMARK")
 
 
 class BLUEPRINT_PT_preview(Panel):
@@ -480,16 +701,25 @@ class BLUEPRINT_PT_preview(Panel):
         layout.label(text="Hidden lines show translucent, not dashed")
 
 
-CLASSES = (BlueprintSettings, BLUEPRINT_OT_import, BLUEPRINT_OT_generate,
+CLASSES = (BlueprintPrefs, BlueprintObject, BlueprintSettings, BLUEPRINT_UL_objects,
+           BLUEPRINT_OT_sync_objects, BLUEPRINT_OT_object_ticks,
+           BLUEPRINT_OT_import, BLUEPRINT_OT_generate,
            BLUEPRINT_OT_preview_refresh, BLUEPRINT_OT_preview_toggle,
            BLUEPRINT_OT_open_output, BLUEPRINT_OT_set_views,
-           BLUEPRINT_PT_main, BLUEPRINT_PT_dimensions, BLUEPRINT_PT_preview)
+           BLUEPRINT_OT_check_updates, BLUEPRINT_OT_open_url,
+           BLUEPRINT_PT_main, BLUEPRINT_PT_dimensions, BLUEPRINT_PT_objects,
+           BLUEPRINT_PT_preview)
 
 
 def register():
     for c in CLASSES:
         bpy.utils.register_class(c)
     bpy.types.Scene.blueprint = PointerProperty(type=BlueprintSettings)
+
+    p = _prefs()
+    if p and p.check_on_start:
+        updates.check_async(bl_info["version"], feed_url=p.feed_url,
+                            on_done=preview.redraw)
 
 
 def unregister():

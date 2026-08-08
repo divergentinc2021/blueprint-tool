@@ -18,7 +18,7 @@ import os
 
 import bmesh
 import bpy
-from mathutils import Vector
+from mathutils import Euler, Vector
 from bpy_extras.object_utils import world_to_camera_view
 
 from . import annotate, render
@@ -38,6 +38,18 @@ VIEWS = {
     "iso":    dict(rot=(54.736, 0.0,  45.0), right=None,       up=None,       out=None),
 }
 VIEW_ORDER = ["front", "back", "left", "right", "top", "bottom", "iso"]
+
+# Standard multiview arrangement, as (column, row) on a 4x3 grid with row 0 at the top.
+# Third angle (US/Canada) puts each view on the side of Front it is seen from; first angle
+# (ISO/Europe) puts it on the opposite side. Getting this wrong inverts the drawing's
+# meaning, so both are offered and the sheet states which is in use.
+PROJECTION = {
+    "third": {"top": (1, 0), "left": (0, 1), "front": (1, 1), "right": (2, 1),
+              "back": (3, 1), "bottom": (1, 2), "iso": (3, 0)},
+    "first": {"bottom": (1, 0), "right": (0, 1), "front": (1, 1), "left": (2, 1),
+              "back": (3, 1), "top": (1, 2), "iso": (3, 0)},
+}
+PROJECTION_COLS, PROJECTION_ROWS = 4, 3
 AXIS_LABEL = {(1, 0, 0): "X", (-1, 0, 0): "X", (0, 1, 0): "Y",
               (0, -1, 0): "Y", (0, 0, 1): "Z", (0, 0, -1): "Z"}
 
@@ -61,7 +73,9 @@ DEFAULTS = dict(
     unit="m",
     page="a4l",
     theme="white",
-    layout="sheet",         # "sheet" = one page per view; "plate" = all views on one page
+    layout="sheet",         # "sheet" (page per view) | "plate" (grid) | "projection"
+    angle="third",          # projection layout convention: "third" or "first"
+    uniform_scale=True,     # one scale across all views of a multiview drawing
     grid=False,
     margin=0.18,
     crease=140.0,
@@ -79,8 +93,13 @@ DEFAULTS = dict(
     dim_auto=False,
     dim_empties=False,
     dim_angle=True,
+    dim_perimeter=False,
     dim_radius_not_dia=False,
     dim_kinds=None,         # None means every kind
+    dim_objects_only=None,  # list of object names to measure; None means all of them
+    dim_offset=1.0,         # multiplier on how far dimensions sit from the geometry
+    dim_step=1.0,           # multiplier on the collision-avoidance stagger
+    dim_text=1.0,           # multiplier on dimension text size
 )
 
 
@@ -258,7 +277,27 @@ def measure(objs, factor, nd=4):
 
 
 # ---------------------------------------------------------------- camera
-def make_camera(name, spec, mn, mx, res_x, res_y, margin, guard=None):
+def axes_for(spec):
+    """(right, up, out) for a view, without building a camera first."""
+    if spec["right"] is not None:
+        return Vector(spec["right"]), Vector(spec["up"]), Vector(spec["out"])
+    m = Euler([math.radians(a) for a in spec["rot"]], "XYZ").to_matrix()
+    return m.col[0].normalized(), m.col[1].normalized(), m.col[2].normalized()
+
+
+def ortho_for(spec, mn, mx, aspect, margin):
+    """World units across the frame width needed to fit the bbox in this view."""
+    right, up, _out = axes_for(spec)
+    centre = (mn + mx) / 2.0
+    corners = [Vector((x, y, z)) for x in (mn.x, mx.x)
+               for y in (mn.y, mx.y) for z in (mn.z, mx.z)]
+    rs = [(c - centre).dot(right) for c in corners]
+    us = [(c - centre).dot(up) for c in corners]
+    keep = 1.0 - 2.0 * margin
+    return max((max(rs) - min(rs)) / keep, ((max(us) - min(us)) / keep) * aspect)
+
+
+def make_camera(name, spec, mn, mx, res_x, res_y, margin, guard=None, force_ortho=None):
     cd = bpy.data.cameras.new(name)
     cd.type = "ORTHO"
     # HORIZONTAL fit fixes ortho_scale to mean "world units across the image width"
@@ -295,6 +334,10 @@ def make_camera(name, spec, mn, mx, res_x, res_y, margin, guard=None):
     ds = [(c - centre).dot(out) for c in corners]
     keep = 1.0 - 2.0 * margin
     ortho = max((max(rs) - min(rs)) / keep, ((max(us) - min(us)) / keep) * aspect)
+    # A multiview drawing must share ONE scale across its views, or the reader cannot
+    # compare them and the stated scale is a lie on all but one.
+    if force_ortho:
+        ortho = force_ortho
     cd.ortho_scale = ortho
 
     dist = max(ds) + diag
@@ -533,9 +576,41 @@ def generate(sheets_out=None, write=True, **kwargs):
     views_meta = {}
     sheets = {}
 
-    plate = o["layout"] == "plate"
+    projection = o["layout"] == "projection"
+    plate = o["layout"] in ("plate", "projection")
     fs_page = px_h * 0.0165
-    if plate:
+
+    if projection:
+        # Standard multiview arrangement: views sit where they project to, on a shared
+        # grid, so Top lines up over Front and Right beside it. Only the occupied part of
+        # the 4x3 grid is used, so a front/top/right drawing is not padded out to full
+        # width by the empty Back column.
+        table = PROJECTION[o["angle"]]
+        used = [v for v in o["views"] if v in table]
+        if not used:
+            raise ValueError("no placeable views for a projection layout")
+        cs = [table[v][0] for v in used]
+        rs = [table[v][1] for v in used]
+        c0, c1, r0, r1 = min(cs), max(cs), min(rs), max(rs)
+        cols, rows = (c1 - c0 + 1), (r1 - r0 + 1)
+        pad = fs_page * 1.4
+        band = fs_page * (1.6 + 1.35 * 6) + fs_page * 2.4
+        area_w = px_w - 2 * pad
+        area_h = px_h - 2 * pad - band
+        cell_w = int((area_w - pad * (cols - 1)) / cols)
+        cell_h = int((area_h - pad * (rows - 1)) / rows)
+        if cell_w < 80 or cell_h < 80:
+            raise ValueError("too many views for one projection sheet at this page size")
+        cells = {}
+        for v in used:
+            c, r = table[v]
+            cells[v] = (pad + (c - c0) * (cell_w + pad),
+                        pad + (r - r0) * (cell_h + pad), cell_w, cell_h)
+        page_sheet = render.Sheet(px_w, px_h, mm_w, mm_h, o["theme"])
+        render.draw_frame(page_sheet, fs_page)
+        if o["grid"]:
+            render.draw_grid(page_sheet, fs_page)
+    elif plate:
         # Lay the views out in a grid whose cell aspect stays close to the page aspect,
         # leaving a band at the bottom for the title block.
         n = len(o["views"])
@@ -572,6 +647,17 @@ def generate(sheets_out=None, write=True, **kwargs):
         cells = {nm: (0, 0, px_w, px_h) for nm in o["views"]}
         page_sheet = None
 
+    # One scale across every view of a multiview drawing. Framing each view to its own
+    # extents makes the same model print at a different ratio per view, which stops the
+    # reader comparing them and makes the stated scale wrong on all but one.
+    shared_ortho = None
+    if o["uniform_scale"] and len(o["views"]) > 1:
+        shared_ortho = max(
+            ortho_for(VIEWS[v], mn, mx,
+                      cells[v][2] / float(cells[v][3]) if v in cells else px_w / float(px_h),
+                      o["margin"])
+            for v in o["views"] if v in cells or not plate)
+
     # Restore the user's scene afterwards when running inside the GUI; the CLI is a
     # throwaway process and skips the bookkeeping.
     with SceneGuard(scene, active=o["use_current_scene"]) as guard:
@@ -582,12 +668,16 @@ def generate(sheets_out=None, write=True, **kwargs):
         gp, mod = make_lineart(o["crease"], guard)
 
         for name in o["views"]:
+            if name not in cells:
+                log("[view] %-7s skipped: no place in this layout" % name)
+                continue
             cell_x, cell_y, cw, ch = cells[name]
             # world_to_camera_view normalises against the scene render resolution, so it
             # must match the cell the view is drawn into or the projection is stretched
             scene.render.resolution_x, scene.render.resolution_y = cw, ch
             cam, mapping = make_camera("bp_cam_" + name, VIEWS[name], mn, mx,
-                                       cw, ch, o["margin"], guard)
+                                       cw, ch, o["margin"], guard,
+                                       force_ortho=shared_ortho)
             scene.camera = cam
             bpy.context.view_layer.update()
 
@@ -658,13 +748,17 @@ def generate(sheets_out=None, write=True, **kwargs):
                     dict(overall=o["dim_overall"], objects=o["dim_objects"],
                          edges=o["dim_edges"], auto=o["dim_auto"],
                          empties=o["dim_empties"], angle=o["dim_angle"],
+                         perimeter=o["dim_perimeter"],
+                         objects_only=o["dim_objects_only"],
                          radius_not_dia=o["dim_radius_not_dia"], kinds=o["dim_kinds"]))
                 placer = annotate.Placer(cw, ch, fs * 1.0)
                 if not plate:
                     # reserve the title block so no dimension lands underneath it
                     tbh = fs * (1.6 + 1.35 * len(meta_rows))
                     placer.reserve((cw - fs * 21.6, ch - tbh - fs * 1.6, fs * 20.0, tbh))
-                n_dims = annotate.draw_dims(sheet, dim_list, scene, cam, fs, placer, bbox_px)
+                n_dims = annotate.draw_dims(sheet, dim_list, scene, cam,
+                                            fs * o["dim_text"], placer, bbox_px,
+                                            offset=o["dim_offset"], step=o["dim_step"])
                 drawn_dims = [{"kind": x.kind, "label": x.label, "source": x.source,
                                "value": round(x.unit_value, 4)
                                if x.unit_value is not None else None}
@@ -711,18 +805,20 @@ def generate(sheets_out=None, write=True, **kwargs):
     if plate:
         render.draw_title_block(page_sheet, fs_page, [
             ("", title),
-            ("Views", ", ".join(v.upper() for v in o["views"])),
+            ("Views", ", ".join(v.upper() for v in o["views"] if v in cells)),
+            ("Projection", ("%s angle" % o["angle"]) if projection else "-"),
             ("Overall", "%s x %s x %s %s" % (fmt(d["x"], o["unit"]), fmt(d["y"], o["unit"]),
                                              fmt(d["z"], o["unit"]), o["unit"])),
             ("Unit", o["unit"]),
             ("Page", "%s (%gx%g mm)" % (o["page"].upper(), mm_w, mm_h)),
             ("Date", datetime.date.today().isoformat()),
         ])
-        sheets["plate"] = page_sheet
+        name_out = "projection" if projection else "plate"
+        sheets[name_out] = page_sheet
         if write:
-            render.write_svg(os.path.join(out_dir, "plate.svg"), page_sheet)
-        log("[plate] %d views on one %s sheet -> plate.svg"
-            % (len(o["views"]), o["page"].upper()))
+            render.write_svg(os.path.join(out_dir, name_out + ".svg"), page_sheet)
+        log("[%s] %d views on one %s sheet -> %s.svg"
+            % (name_out, len(cells), o["page"].upper(), name_out))
 
     if sheets_out is not None:
         sheets_out.update(sheets)
@@ -730,7 +826,8 @@ def generate(sheets_out=None, write=True, **kwargs):
     pdf_path = None
     if o["pdf"] and write:
         pdf_path = os.path.join(out_dir, "blueprints.pdf")
-        order = ["plate"] if plate else [v for v in o["views"] if v in sheets]
+        order = ([("projection" if projection else "plate")] if plate
+                 else [v for v in o["views"] if v in sheets])
         render.write_pdf(pdf_path, [sheets[v] for v in order], title)
         log("[pdf]   %d page%s -> %s"
             % (len(sheets), "" if len(sheets) == 1 else "s", os.path.basename(pdf_path)))
