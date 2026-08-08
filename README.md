@@ -43,7 +43,9 @@ live over the viewport.
 
 ![preview](docs/preview.png)
 
-Preview refresh is explicit, not automatic: rebuilding bakes Line Art, which is far too
+The preview sits in a corner of the viewport at a size, position and opacity you set, with
+a labelled **Hide Preview** button — it used to fill the viewport, which hid the very model
+it previews. Refresh is explicit, not automatic: rebuilding bakes Line Art, which is far too
 heavy to run on every viewport redraw, so the panel tells you when the cached preview has
 gone stale. Two honest differences from the file output — hidden lines show translucent
 rather than dashed, since GPU line drawing has no dash pattern, and text uses Blender's
@@ -55,8 +57,14 @@ cameras and Line Art object are deleted. It will not disturb the scene you are w
 
 ## Themes and layout
 
-Six paper themes: `white`, `blueprint`, `cyanotype`, `sepia`, `steel`, `dark`. `--grid`
-adds the faint graticule of real blueprint paper.
+Six paper themes: `white`, `blueprint`, `cyanotype`, `noir`, `sepia`, `steel`. `--grid`
+adds the graticule of real blueprint paper.
+
+Line weights are specified in **real millimetres** and follow the drafting convention that
+weight carries meaning: the object outline heaviest, hidden detail lighter, the measuring
+apparatus lighter still, the paper grid barely there. Pixel constants cannot do this,
+because the same value is a different physical line on A4 and A2. Circular features the
+view sees face-on get a dash-dot centre mark.
 
 ![themes](docs/themes.png)
 
@@ -80,6 +88,35 @@ Multiview drawings share **one scale** across every view by default. Framing eac
 its own extents makes the same model print at a different ratio per view, which stops the
 reader comparing them and makes the stated scale wrong on all but one. `--no-uniform-scale`
 turns that off.
+
+## Title block
+
+The title block is a heading band over a two-column field grid, and the fields are yours:
+
+```bash
+./bp part.fbx --field "Drawing No=UIZ-014" --field "Rev=B" --field "Material=Mild steel" \
+              --field "Scale=" --field "Overall=" --field "Date="
+```
+
+A field with an empty value is filled in from the drawing when its label is one of `View`,
+`Scale`, `Overall`, `Unit`, `Page`, `Date`, `Projection`, `Sheet` or `Drawn`. Anything else
+passes through verbatim, so a sheet can carry a drawing number, client or revision the tool
+knows nothing about. The add-on's **Title Block** sub-panel edits the same list.
+
+## Detail callouts
+
+Ring a group of objects on a view and get an enlarged view of them beside it, the way a
+drawing does it:
+
+```bash
+./bp part.fbx --projection --detail "A=Bearing,Shaft" --detail "B=Seal" --detail-on front
+```
+
+The callout is a dashed ring with a leader and a letter in the theme's accent colour; the
+enlargement is captioned `DETAIL A` with its own scale, and it is deliberately excluded
+from the shared scale — an enlargement drawn at the sheet scale would not be one. Its
+linework is clipped to its own frame, since Line Art still returns every stroke in the
+scene. In the add-on, select the objects and press **+** in the Detail Callouts panel.
 
 ## Dimensions
 
@@ -254,6 +291,11 @@ scripts folder, so the installed copy is a snapshot, not a live link.
 - **`bpy.ops.preferences.addon_remove` cannot run headless** — it ends with
   `context.area.tag_redraw()` and `context.area` is None in background mode, so it raises
   *after* deleting the files, leaving preferences pointing at an add-on that is gone.
+- **Turning `use_multiple_levels` off does not reset the level.** With it off,
+  `level_start` *is* the occlusion level drawn, so leaving it at 1 after a hidden-line pass
+  makes the NEXT view draw its once-occluded lines as its visible outline. Every view after
+  the first was silently wrong whenever hidden lines were on. Set the levels explicitly for
+  every pass.
 - GPv3 stores strokes as flat point attributes plus `curve_offsets`, not `stroke.points`.
 - Modifier property names: `use_material` (not `use_material_boundary`), `radius` (not
   `thickness`).

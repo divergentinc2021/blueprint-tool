@@ -24,6 +24,25 @@ from . import render
 _handle = None
 _state = {"sheet": None, "view": "", "stale": True}
 
+# The preview used to fill the viewport, which hid the model it is a preview OF and left
+# no obvious way out. It now sits in a corner at a fraction of the region by default, and
+# "fill" is something you opt into.
+_opts = {"size": 0.42, "corner": "BOTTOM_RIGHT", "opacity": 1.0}
+
+
+def set_options(size=None, corner=None, opacity=None):
+    if size is not None:
+        _opts["size"] = max(0.15, min(float(size), 1.0))
+    if corner is not None:
+        _opts["corner"] = corner
+    if opacity is not None:
+        _opts["opacity"] = max(0.15, min(float(opacity), 1.0))
+    redraw()
+
+
+def options():
+    return dict(_opts)
+
 
 # ---------------------------------------------------------------- cache
 def set_sheet(sheet, view_name):
@@ -55,12 +74,27 @@ def redraw():
 
 # ---------------------------------------------------------------- drawing
 def _fit(sheet, region, pad=16.0):
-    """Letterbox the page into the region. Returns (scale, origin_x, origin_y)."""
-    aw = max(region.width - 2 * pad, 1.0)
-    ah = max(region.height - 2 * pad, 1.0)
+    """
+    Place the page in the region at the configured size and corner.
+
+    Returns (scale, origin_x, origin_y) with the origin at the page's bottom-left in
+    region coordinates.
+    """
+    frac = _opts["size"]
+    aw = max(region.width * frac - 2 * pad, 1.0)
+    ah = max(region.height * frac - 2 * pad, 1.0)
     s = min(aw / sheet.px_w, ah / sheet.px_h)
-    ox = (region.width - sheet.px_w * s) / 2.0
-    oy = (region.height - sheet.px_h * s) / 2.0
+    pw, ph = sheet.px_w * s, sheet.px_h * s
+
+    corner = _opts["corner"]
+    if corner == "CENTER":
+        ox = (region.width - pw) / 2.0
+        oy = (region.height - ph) / 2.0
+    else:
+        left = "LEFT" in corner
+        bottom = "BOTTOM" in corner
+        ox = pad if left else region.width - pw - pad
+        oy = pad if bottom else region.height - ph - pad
     return s, ox, oy
 
 
@@ -93,6 +127,8 @@ def _draw():
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     poly = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
+    alpha = _opts["opacity"]
+    ink_alpha = max(alpha, 0.85)      # keep the linework readable even when faded back
 
     # --- filled shapes first, in sheet order
     tris = {}
@@ -107,7 +143,7 @@ def _draw():
             for i in range(1, len(p) - 1):
                 tris.setdefault(fill, []).extend([p[0], p[i], p[i + 1]])
     for colour, verts in tris.items():
-        shader.uniform_float("color", _rgba(colour))
+        shader.uniform_float("color", _rgba(colour, alpha))
         batch_for_shader(shader, "TRIS", {"pos": verts}).draw(shader)
 
     # --- lines, batched by colour and width so a 2000-stroke drawing is a handful of
@@ -139,21 +175,25 @@ def _draw():
             continue
         poly.uniform_float("lineWidth", width)
         # no dash pattern in GPU line drawing; hidden lines read as translucent instead
-        poly.uniform_float("color", _rgba(colour, 0.4 if dashed else 1.0))
+        poly.uniform_float("color",
+                           _rgba(colour, ink_alpha * (0.4 if dashed else 1.0)))
         batch_for_shader(poly, "LINES", {"pos": verts}).draw(poly)
 
     # --- text
     for op in sheet.ops:
         if op[0] != "text":
             continue
-        _, x, y, txt, size, fill, anchor, bold, rotate = op
+        _, x, y, txt, size, fill, anchor, bold, rotate, track = op
         px = size * s
         if px < 5.0:            # unreadable at this zoom; drawing it is just noise
             continue
         _set_font_size(px)
         r, g, b = render.hex_rgb(fill)
-        blf.color(0, r, g, b, 1.0)
+        blf.color(0, r, g, b, ink_alpha)
+        # blf has no letter-spacing, so tracked text is drawn tight; widen the measured
+        # width so the anchor still lands where the file output puts it
         tw, th = blf.dimensions(0, txt)
+        tw += track * s * max(len(txt) - 1, 0)
         sx, sy = P(x, y)
         if rotate:
             blf.enable(0, blf.ROTATION)
@@ -166,6 +206,11 @@ def _draw():
             off = 0.0 if anchor == "start" else (-tw / 2.0 if anchor == "middle" else -tw)
             blf.position(0, sx + off, sy, 0)
             blf.draw(0, txt)
+
+    edge = [P(0, 0), P(sheet.px_w, 0), P(sheet.px_w, sheet.px_h), P(0, sheet.px_h), P(0, 0)]
+    poly.uniform_float("lineWidth", 2.0)
+    poly.uniform_float("color", (0.0, 0.0, 0.0, 0.35 * alpha))
+    batch_for_shader(poly, "LINE_STRIP", {"pos": edge}).draw(poly)
 
     gpu.state.blend_set("NONE")
 

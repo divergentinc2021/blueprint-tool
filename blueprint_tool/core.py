@@ -100,7 +100,49 @@ DEFAULTS = dict(
     dim_offset=1.0,         # multiplier on how far dimensions sit from the geometry
     dim_step=1.0,           # multiplier on the collision-avoidance stagger
     dim_text=1.0,           # multiplier on dimension text size
+    centre_marks=True,      # dash-dot cross through circular features seen face-on
+    # Title block fields. Every entry is (label, value); a value of None is filled in from
+    # the drawing itself. The caller owns this list, so a sheet can carry whatever the job
+    # needs rather than a fixed set baked into the tool.
+    fields=None,
+    # Detail callouts: [{"name": "A", "objects": [...], "on": "front"}]. Each rings its
+    # region on the parent view and gets an enlarged view of its own.
+    details=None,
 )
+
+# Filled in from the drawing when a field's value is left as None.
+AUTO_FIELDS = ("view", "views", "scale", "overall", "unit", "page", "date", "projection",
+               "sheet", "drawn")
+
+
+def resolve_fields(fields, auto, plate=False):
+    """
+    Turn the caller's field list into (label, value) pairs ready for the title block.
+
+    A value of None means "fill this in from the drawing", matched case-insensitively
+    against AUTO_FIELDS by the field's own label. Anything else is passed through verbatim,
+    so a sheet can carry a drawing number, a client or a revision the tool knows nothing
+    about.
+    """
+    out = []
+    for item in (fields or default_fields()):
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            k, v = item[0], item[1]
+        else:
+            k, v = str(item), None
+        if v is None or v == "":
+            key = str(k).strip().lower()
+            if plate and key == "view":
+                key = "views"
+            v = auto.get(key, "")
+        if str(k).strip():
+            out.append((str(k), str(v)))
+    return out
+
+
+def default_fields():
+    return [("View", None), ("Scale", None), ("Overall", None), ("Unit", None),
+            ("Page", None), ("Date", None)]
 
 
 # ---------------------------------------------------------------- scene loading
@@ -277,6 +319,16 @@ def measure(objs, factor, nd=4):
 
 
 # ---------------------------------------------------------------- camera
+def detail_bounds(scene, spec):
+    """World bounding box of the objects a detail callout covers."""
+    names = set(spec.get("objects") or [])
+    objs = [o for o in mesh_objects(scene) if o.name in names]
+    if not objs:
+        return None
+    pts = [o.matrix_world @ Vector(c) for o in objs for c in o.bound_box]
+    return aabb(pts)
+
+
 def axes_for(spec):
     """(right, up, out) for a view, without building a camera first."""
     if spec["right"] is not None:
@@ -384,72 +436,71 @@ def make_lineart(crease_deg, guard=None):
     return gp, mod
 
 
-def mark_silhouette(objs, out_axis):
+class Silhouette:
     """
-    Mark this view's silhouette edges as Freestyle edge marks, and return a restore call.
+    Per-view silhouette edges, handed to Line Art as Freestyle edge marks.
 
-    Line Art draws creases, boundaries and intersections, but produces no contour for a
+    Line Art draws creases, boundaries and intersections but produces no contour for a
     smooth curved surface: a plain cylinder comes out as two cap rings with nothing joining
-    them, because its side edges meet at ~169 degrees and so are not creases. Raising the
-    crease threshold far enough to catch them turns the cylinder into a striped barrel
-    instead, since every side edge qualifies.
-
-    A silhouette edge is one whose two faces disagree about facing the camera (or a
-    boundary edge with a single face). Computing that here and handing it to Line Art as
-    edge marks means Line Art still does the occlusion, so the silhouette is hidden behind
-    other geometry exactly like the rest of the linework — which drawing it ourselves on
+    them, because its side edges meet at ~169 degrees and so are not creases. Marking the
+    silhouette lets Line Art draw it AND occlusion-test it, which drawing it ourselves on
     top would not achieve.
 
-    Silhouettes are view-dependent, so this is redone per view.
+    The attribute is created once for the whole run and only its VALUES change per view.
+    Creating and removing it per view looked equivalent and was not: after the first
+    create/remove cycle Line Art stopped honouring the marks, and a detail view rendered as
+    bare cap rings with its silhouette missing.
     """
-    saved = []
-    for o in objs:
-        me = o.data
-        n_edges = len(me.edges)
-        if not n_edges:
-            continue
 
-        # Blender 5.0 stores freestyle marks as a generic BOOLEAN attribute on the EDGE
-        # domain; MeshEdge.use_freestyle_mark no longer exists.
-        attr = me.attributes.get("freestyle_edge")
-        existed = attr is not None
-        if not existed:
-            attr = me.attributes.new(name="freestyle_edge", type="BOOLEAN", domain="EDGE")
-        before = [False] * n_edges
-        attr.data.foreach_get("value", before)
-        saved.append((me, before, existed))
+    def __init__(self, objs):
+        self.saved = []
+        for o in objs:
+            me = o.data
+            if not len(me.edges):
+                continue
+            attr = me.attributes.get("freestyle_edge")
+            existed = attr is not None
+            if not existed:
+                attr = me.attributes.new(name="freestyle_edge", type="BOOLEAN",
+                                         domain="EDGE")
+            before = [False] * len(me.edges)
+            attr.data.foreach_get("value", before)
+            self.saved.append((o, me, before, existed))
 
-        # inverse transpose so non-uniform scale still yields correct normals
-        nmat = o.matrix_world.to_3x3().inverted_safe().transposed()
-        bm = bmesh.new()
-        bm.from_mesh(me)
-        bm.edges.ensure_lookup_table()
-        marks = list(before)
-        for e in bm.edges:
-            faces = e.link_faces
-            if len(faces) == 1:
-                marks[e.index] = True            # open boundary is always a silhouette
-            elif len(faces) == 2:
-                d0 = (nmat @ faces[0].normal).dot(out_axis)
-                d1 = (nmat @ faces[1].normal).dot(out_axis)
-                if (d0 > 0.0) != (d1 > 0.0):     # faces disagree about facing the camera
-                    marks[e.index] = True
-        bm.free()
-        attr.data.foreach_set("value", marks)
-        me.update()
+    def apply(self, out_axis):
+        """Rewrite the marks for a view direction. A silhouette is view-dependent."""
+        for o, me, before, _existed in self.saved:
+            nmat = o.matrix_world.to_3x3().inverted_safe().transposed()
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            bm.edges.ensure_lookup_table()
+            marks = list(before)
+            for e in bm.edges:
+                faces = e.link_faces
+                if len(faces) == 1:
+                    marks[e.index] = True          # an open boundary is always a silhouette
+                elif len(faces) == 2:
+                    d0 = (nmat @ faces[0].normal).dot(out_axis)
+                    d1 = (nmat @ faces[1].normal).dot(out_axis)
+                    if (d0 > 0.0) != (d1 > 0.0):   # the faces disagree about facing us
+                        marks[e.index] = True
+            bm.free()
+            attr = me.attributes.get("freestyle_edge")
+            if attr is not None:
+                attr.data.foreach_set("value", marks)
+                me.update()
 
-    def restore():
-        for me, before, existed in saved:
+    def restore(self):
+        for _o, me, before, existed in self.saved:
             attr = me.attributes.get("freestyle_edge")
             if attr is None:
                 continue
             if existed:
                 attr.data.foreach_set("value", before)
             else:
-                me.attributes.remove(attr)       # we created it; leave no trace
+                me.attributes.remove(attr)         # we created it; leave no trace
             me.update()
-
-    return restore
+        self.saved = []
 
 
 def bake_strokes(gp):
@@ -580,6 +631,21 @@ def generate(sheets_out=None, write=True, **kwargs):
     plate = o["layout"] in ("plate", "projection")
     fs_page = px_h * 0.0165
 
+    # A detail is rendered like any other view, so it gets a cell from the same layout
+    # machinery rather than needing free-space hunting of its own.
+    details = []
+    for i, spec in enumerate(o["details"] or []):
+        bounds = detail_bounds(scene, spec)
+        if bounds is None:
+            log("[detail] %s skipped: none of its objects are in the scene"
+                % spec.get("name", "?"))
+            continue
+        details.append(dict(name=(spec.get("name") or chr(65 + i)).upper(),
+                            on=spec.get("on") or o["views"][0],
+                            mn=bounds[0], mx=bounds[1]))
+    detail_keys = ["detail:" + d["name"] for d in details]
+    all_views = list(o["views"]) + detail_keys
+
     if projection:
         # Standard multiview arrangement: views sit where they project to, on a shared
         # grid, so Top lines up over Front and Right beside it. Only the occupied part of
@@ -587,6 +653,13 @@ def generate(sheets_out=None, write=True, **kwargs):
         # width by the empty Back column.
         table = PROJECTION[o["angle"]]
         used = [v for v in o["views"] if v in table]
+        # details take the free slots of the projection grid, in reading order
+        free = [(c, r) for r in range(PROJECTION_ROWS) for c in range(PROJECTION_COLS)
+                if (c, r) not in [table[v] for v in used]]
+        table = dict(table)
+        for key, slot in zip(detail_keys, free):
+            table[key] = slot
+        used = used + [k for k in detail_keys if k in table]
         if not used:
             raise ValueError("no placeable views for a projection layout")
         cs = [table[v][0] for v in used]
@@ -594,7 +667,8 @@ def generate(sheets_out=None, write=True, **kwargs):
         c0, c1, r0, r1 = min(cs), max(cs), min(rs), max(rs)
         cols, rows = (c1 - c0 + 1), (r1 - r0 + 1)
         pad = fs_page * 1.4
-        band = fs_page * (1.6 + 1.35 * 6) + fs_page * 2.4
+        band = render.title_block_height(
+            fs_page, len(o["fields"] or default_fields())) + fs_page * 2.2
         area_w = px_w - 2 * pad
         area_h = px_h - 2 * pad - band
         cell_w = int((area_w - pad * (cols - 1)) / cols)
@@ -613,9 +687,10 @@ def generate(sheets_out=None, write=True, **kwargs):
     elif plate:
         # Lay the views out in a grid whose cell aspect stays close to the page aspect,
         # leaving a band at the bottom for the title block.
-        n = len(o["views"])
+        n = len(all_views)
         pad = fs_page * 1.8
-        band = fs_page * (1.6 + 1.35 * 6) + fs_page * 2.4
+        band = render.title_block_height(
+            fs_page, len(o["fields"] or default_fields())) + fs_page * 2.2
         page_aspect = (px_w - 2 * pad) / float(px_h - 2 * pad - band)
         # Pick the grid whose cells are closest in shape to the page, preferring one with
         # no empty slots. sqrt(n * aspect) alone puts 4 views in 3 columns and leaves a
@@ -628,7 +703,6 @@ def generate(sheets_out=None, write=True, **kwargs):
             if best is None or score < best[0]:
                 best = (score, c, r)
         cols, rows = best[1], best[2]
-        band = fs_page * (1.6 + 1.35 * 6) + fs_page * 2.4      # title block height
         area_w = px_w - 2 * pad
         area_h = px_h - 2 * pad - band
         cell_w = int((area_w - pad * (cols - 1)) / cols)
@@ -636,7 +710,7 @@ def generate(sheets_out=None, write=True, **kwargs):
         if cell_w < 80 or cell_h < 80:
             raise ValueError("too many views for one plate at this page size")
         cells = {}
-        for i, nm in enumerate(o["views"]):
+        for i, nm in enumerate(all_views):
             r, c = divmod(i, cols)
             cells[nm] = (pad + c * (cell_w + pad), pad + r * (cell_h + pad), cell_w, cell_h)
         page_sheet = render.Sheet(px_w, px_h, mm_w, mm_h, o["theme"])
@@ -644,19 +718,25 @@ def generate(sheets_out=None, write=True, **kwargs):
         if o["grid"]:
             render.draw_grid(page_sheet, fs_page)
     else:
-        cells = {nm: (0, 0, px_w, px_h) for nm in o["views"]}
+        cells = {nm: (0, 0, px_w, px_h) for nm in all_views}
         page_sheet = None
 
     # One scale across every view of a multiview drawing. Framing each view to its own
     # extents makes the same model print at a different ratio per view, which stops the
     # reader comparing them and makes the stated scale wrong on all but one.
     shared_ortho = None
+    shared_scale = None
     if o["uniform_scale"] and len(o["views"]) > 1:
+        # details are deliberately excluded: an enlargement that shares the sheet scale
+        # would not be an enlargement
         shared_ortho = max(
             ortho_for(VIEWS[v], mn, mx,
                       cells[v][2] / float(cells[v][3]) if v in cells else px_w / float(px_h),
                       o["margin"])
             for v in o["views"] if v in cells or not plate)
+        first = next((v for v in o["views"] if v in cells), None)
+        if first:
+            shared_scale = ((mm_w * cells[first][2] / float(px_w)) / 1000.0) / shared_ortho
 
     # Restore the user's scene afterwards when running inside the GUI; the CLI is a
     # throwaway process and skips the bookkeeping.
@@ -666,27 +746,38 @@ def generate(sheets_out=None, write=True, **kwargs):
         scene.frame_start = scene.frame_end = scene.frame_current = 1
         setup_render(scene, px_w, px_h)
         gp, mod = make_lineart(o["crease"], guard)
+        silh = Silhouette(objs) if o["silhouette"] else None
 
-        for name in o["views"]:
+        for name in all_views:
             if name not in cells:
                 log("[view] %-7s skipped: no place in this layout" % name)
                 continue
+            detail = next((d for d in details if "detail:" + d["name"] == name), None)
+            v_mn, v_mx = (detail["mn"], detail["mx"]) if detail else (mn, mx)
+            spec_name = detail["on"] if detail else name
             cell_x, cell_y, cw, ch = cells[name]
             # world_to_camera_view normalises against the scene render resolution, so it
             # must match the cell the view is drawn into or the projection is stretched
             scene.render.resolution_x, scene.render.resolution_y = cw, ch
-            cam, mapping = make_camera("bp_cam_" + name, VIEWS[name], mn, mx,
+            cam, mapping = make_camera("bp_cam_" + name.replace(":", "_"),
+                                       VIEWS[spec_name], v_mn, v_mx,
                                        cw, ch, o["margin"], guard,
-                                       force_ortho=shared_ortho)
+                                       force_ortho=None if detail else shared_ortho)
             scene.camera = cam
             bpy.context.view_layer.update()
 
             # out_axis points from the model toward the camera
-            restore_marks = (mark_silhouette(objs, Vector(mapping["screen_out_axis"]))
-                             if o["silhouette"] else (lambda: None))
+            if silh is not None:
+                silh.apply(Vector(mapping["screen_out_axis"]))
 
+            # Set the occlusion level explicitly for every pass. With use_multiple_levels
+            # off, level_start IS the level drawn, so leaving it at 1 after a hidden-line
+            # pass makes the NEXT view draw its once-occluded lines as if they were the
+            # visible outline.
             if hasattr(mod, "use_multiple_levels"):
                 mod.use_multiple_levels = False
+                mod.level_start = 0
+                mod.level_end = 0
             bake_strokes(gp)
             visible = read_strokes(gp, scene, cam, cw, ch)
 
@@ -697,33 +788,39 @@ def generate(sheets_out=None, write=True, **kwargs):
                 bake_strokes(gp)
                 hidden = read_strokes(gp, scene, cam, cw, ch)
                 mod.use_multiple_levels = False
-            restore_marks()
+                mod.level_start = mod.level_end = 0
 
             # dimension the projected model bbox, not the linework extents
-            corners = [Vector((x, y, z)) for x in (mn.x, mx.x)
-                       for y in (mn.y, mx.y) for z in (mn.z, mx.z)]
+            corners = [Vector((x, y, z)) for x in (v_mn.x, v_mx.x)
+                       for y in (v_mn.y, v_mx.y) for z in (v_mn.z, v_mx.z)]
             proj = [world_to_camera_view(scene, cam, c) for c in corners]
             bx = [p.x * cw for p in proj]
             by = [(1 - p.y) * ch for p in proj]
             bbox_px = (min(bx), min(by), max(bx), max(by))
 
             right, up = Vector(mapping["screen_right_axis"]), Vector(mapping["screen_up_axis"])
-            span = mx - mn
+            span = v_mx - v_mn
             w_world = abs(span.dot(right)) * factor
             h_world = abs(span.dot(up)) * factor
             scale_ratio = ((mm_w * cw / float(px_w)) / 1000.0) / mapping["ortho_scale_world"]
             scale_text = ("1:%.1f" % (1.0 / scale_ratio)) if scale_ratio < 1 \
                 else ("%.1f:1" % scale_ratio)
 
-            meta_rows = [
-                ("", title),
-                ("View", name.upper()),
-                ("Overall", "%s x %s x %s %s" % (fmt(d["x"], o["unit"]), fmt(d["y"], o["unit"]),
-                                                 fmt(d["z"], o["unit"]), o["unit"])),
-                ("Scale", scale_text),
-                ("Page", "%s (%gx%g mm)" % (o["page"].upper(), mm_w, mm_h)),
-                ("Date", datetime.date.today().isoformat()),
-            ]
+            auto = {
+                "view": name.upper().replace("DETAIL:", "DETAIL "),
+                "views": ", ".join(v.upper() for v in o["views"] if v in cells),
+                "scale": scale_text,
+                "overall": "%s x %s x %s %s" % (fmt(d["x"], o["unit"]),
+                                                fmt(d["y"], o["unit"]),
+                                                fmt(d["z"], o["unit"]), o["unit"]),
+                "unit": o["unit"],
+                "page": "%s  %gx%g mm" % (o["page"].upper(), mm_w, mm_h),
+                "date": datetime.date.today().isoformat(),
+                "projection": ("%s angle" % o["angle"]) if projection else "-",
+                "sheet": "1 of 1",
+                "drawn": "",
+            }
+            meta_rows = resolve_fields(o["fields"], auto)
 
             # ---- build the view at cell size; page chrome is added by whoever owns
             #      the page (this sheet when one view per page, the plate otherwise)
@@ -734,17 +831,28 @@ def generate(sheets_out=None, write=True, **kwargs):
                 render.draw_frame(sheet, fs)
                 if o["grid"]:
                     render.draw_grid(sheet, fs)
+            dash = sheet.px_per_mm * 1.6
+            inset = 0.0 if plate else 9.0 * sheet.px_per_mm
+            clip = (inset, inset, cw - inset, ch - inset)
             if hidden:
                 for p in hidden:
-                    sheet.polyline(p, sheet.theme["hidden"], 2.0, dash=(14, 10))
+                    for run in render.clip_polyline(p, *clip):
+                        sheet.polyline(run, sheet.theme["hidden"], sheet.w("hidden"),
+                                       dash=(dash, dash * 0.62))
             for p in visible:
-                sheet.polyline(p, sheet.theme["ink"], 3.2)
+                for run in render.clip_polyline(p, *clip):
+                    sheet.polyline(run, sheet.theme["ink"], sheet.w("outline"))
 
             n_dims = 0
             drawn_dims = []
             if o["dims"] and name != "iso":
+                scope = ([ob for ob in objs
+                          if any(ob.name in (sp.get("objects") or [])
+                                 for sp in (o["details"] or [])
+                                 if (sp.get("name") or "").upper() == detail["name"])]
+                         or objs) if detail else objs
                 dim_list = annotate.collect(
-                    scene, objs, mn, mx, right, up, factor, o["unit"],
+                    scene, scope, v_mn, v_mx, right, up, factor, o["unit"],
                     dict(overall=o["dim_overall"], objects=o["dim_objects"],
                          edges=o["dim_edges"], auto=o["dim_auto"],
                          empties=o["dim_empties"], angle=o["dim_angle"],
@@ -754,8 +862,11 @@ def generate(sheets_out=None, write=True, **kwargs):
                 placer = annotate.Placer(cw, ch, fs * 1.0)
                 if not plate:
                     # reserve the title block so no dimension lands underneath it
-                    tbh = fs * (1.6 + 1.35 * len(meta_rows))
-                    placer.reserve((cw - fs * 21.6, ch - tbh - fs * 1.6, fs * 20.0, tbh))
+                    tbh = render.title_block_height(fs, len(meta_rows))
+                    placer.reserve((cw - fs * 23.0, ch - tbh - fs * 1.2, fs * 23.0, tbh))
+                if o["centre_marks"]:
+                    annotate.draw_centre_marks(sheet, dim_list, scene, cam,
+                                               Vector(mapping["screen_out_axis"]))
                 n_dims = annotate.draw_dims(sheet, dim_list, scene, cam,
                                             fs * o["dim_text"], placer, bbox_px,
                                             offset=o["dim_offset"], step=o["dim_step"])
@@ -764,16 +875,34 @@ def generate(sheets_out=None, write=True, **kwargs):
                                if x.unit_value is not None else None}
                               for x in dim_list]
 
+            # ring the enlarged regions on whichever view they belong to
+            for dt in details:
+                if dt["on"] != name:
+                    continue
+                dc = (dt["mn"] + dt["mx"]) / 2.0
+                cp = world_to_camera_view(scene, cam, dc)
+                corners_d = [Vector((x, y, z)) for x in (dt["mn"].x, dt["mx"].x)
+                             for y in (dt["mn"].y, dt["mx"].y)
+                             for z in (dt["mn"].z, dt["mx"].z)]
+                pj = [world_to_camera_view(scene, cam, c) for c in corners_d]
+                rx = (max(p.x for p in pj) - min(p.x for p in pj)) * cw
+                ry = (max(p.y for p in pj) - min(p.y for p in pj)) * ch
+                render.detail_callout(sheet, cp.x * cw, (1 - cp.y) * ch,
+                                      max(math.hypot(rx, ry) * 0.55, fs * 1.4),
+                                      dt["name"], fs)
+
             if plate:
                 page_sheet.blit(sheet, cell_x, cell_y)
-                page_sheet.text(cell_x + cw / 2.0, cell_y + ch - fs * 0.2,
-                                name.upper(), fs * 0.85, page_sheet.theme["faint"],
-                                anchor="middle")
+                cap = ("DETAIL %s" % detail["name"]) if detail else name
+                render.caption(page_sheet, cell_x + cw / 2.0, cell_y + ch - fs * 0.6,
+                               cap, fs_page, sub=scale_text if detail else None)
             else:
-                render.draw_title_block(sheet, fs, meta_rows)
+                render.draw_title_block(sheet, fs, meta_rows, title=title)
                 sheets[name] = sheet
 
-            svg_path = os.path.join(out_dir, name + ".svg")
+            # a colon is illegal in a Windows filename, and "detail:A" is a view key,
+            # not a file name
+            svg_path = os.path.join(out_dir, name.replace(":", "-") + ".svg")
             if write:
                 render.write_svg(svg_path, sheet)
 
@@ -791,7 +920,7 @@ def generate(sheets_out=None, write=True, **kwargs):
 
             if o["png"] and write:
                 gp.hide_render = True
-                png_path = os.path.join(out_dir, name + ".png")
+                png_path = os.path.join(out_dir, name.replace(":", "-") + ".png")
                 scene.render.filepath = png_path
                 bpy.ops.render.render(write_still=True)
                 gp.hide_render = False
@@ -802,17 +931,18 @@ def generate(sheets_out=None, write=True, **kwargs):
                 % (name, len(visible), (" +%d hidden" % len(hidden)) if hidden else "",
                    (" %d dims" % n_dims) if n_dims else "", scale_text, mapping["svg"]))
 
+        # the marks are ours; put the meshes back exactly as they were
+        if silh is not None:
+            silh.restore()
+
     if plate:
-        render.draw_title_block(page_sheet, fs_page, [
-            ("", title),
-            ("Views", ", ".join(v.upper() for v in o["views"] if v in cells)),
-            ("Projection", ("%s angle" % o["angle"]) if projection else "-"),
-            ("Overall", "%s x %s x %s %s" % (fmt(d["x"], o["unit"]), fmt(d["y"], o["unit"]),
-                                             fmt(d["z"], o["unit"]), o["unit"])),
-            ("Unit", o["unit"]),
-            ("Page", "%s (%gx%g mm)" % (o["page"].upper(), mm_w, mm_h)),
-            ("Date", datetime.date.today().isoformat()),
-        ])
+        plate_auto = dict(auto)
+        plate_auto["view"] = plate_auto["views"]
+        plate_auto["scale"] = ("1:%.1f" % (1.0 / shared_scale)) if shared_scale and \
+            shared_scale < 1 else (auto["scale"])
+        render.draw_title_block(page_sheet, fs_page,
+                                resolve_fields(o["fields"], plate_auto, plate=True),
+                                title=title)
         name_out = "projection" if projection else "plate"
         sheets[name_out] = page_sheet
         if write:
@@ -842,6 +972,8 @@ def generate(sheets_out=None, write=True, **kwargs):
                   "note": "Blender stores geometry in metres; reported values are "
                           "metres * scale_length * unit factor."},
         "scene": scene_dims, "objects": per_object, "views": views_meta,
+        "details": [{"name": dt["name"], "on": dt["on"]} for dt in details],
+        "fields": [list(f) for f in (o["fields"] or default_fields())],
         "output_dir": out_dir, "theme": o["theme"], "layout": o["layout"],
         "pdf": os.path.basename(pdf_path) if pdf_path else None,
         "caveats": [

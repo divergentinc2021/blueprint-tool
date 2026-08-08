@@ -32,7 +32,8 @@ KINDS = ("linear", "length", "diameter", "radius", "angle", "perimeter")
 class Dim:
     """One measurement, in world space, before any view is chosen."""
 
-    def __init__(self, kind, a, b, value, label, source, centre=None, unit_value=None):
+    def __init__(self, kind, a, b, value, label, source, centre=None, unit_value=None,
+                 normal=None, radius=None):
         self.kind = kind          # one of KINDS
         self.a = a                # world Vector: measurement start
         self.b = b                # world Vector: measurement end
@@ -41,6 +42,8 @@ class Dim:
         self.source = source      # human-readable provenance
         self.centre = centre      # world Vector for diameter/radius/angle
         self.unit_value = unit_value
+        self.normal = normal      # circle axis, for deciding if it reads round in a view
+        self.radius = radius
 
     def __repr__(self):
         return "<Dim %s %s %s>" % (self.kind, self.label, self.source)
@@ -245,14 +248,14 @@ def from_auto(objects, factor, unit, as_radius=False, tol=0.03, limit=12, min_ve
                 out.append(Dim("radius", centre, centre + Vector((radius, 0, 0)), radius,
                                _label(radius * factor, unit, "R "),
                                "auto:%s:r" % o.name, centre=centre,
-                               unit_value=radius * factor))
+                               unit_value=radius * factor, normal=n, radius=radius))
             else:
                 dia = radius * 2.0
                 out.append(Dim("diameter", centre - Vector((radius, 0, 0)),
                                centre + Vector((radius, 0, 0)), dia,
                                _label(dia * factor, unit, "dia "),
                                "auto:%s:d" % o.name, centre=centre,
-                               unit_value=dia * factor))
+                               unit_value=dia * factor, normal=n, radius=radius))
     # biggest features first, then trim — a dense mesh can yield hundreds
     out.sort(key=lambda d: -d.value)
     return out[:limit]
@@ -387,10 +390,47 @@ class Placer:
         return cx, cy, False
 
 
+def _dim_text(sheet, cx, cy, label, fs, colour):
+    """Dimension value: lightly tracked, on a punched plate so the line does not cross it."""
+    track = fs * 0.05
+    render.label_plate(sheet, cx, cy, label, fs, track=track)
+    sheet.text(cx, cy + fs * 0.34, label, fs, colour, anchor="middle", track=track)
+
+
 def _project(scene, cam, p, px_w, px_h):
     from bpy_extras.object_utils import world_to_camera_view
     n = world_to_camera_view(scene, cam, p)
     return Vector((n.x * px_w, (1.0 - n.y) * px_h))
+
+
+def draw_centre_marks(sheet, dims, scene, cam, out_axis):
+    """
+    Dash-dot cross through every circular feature the view sees face-on.
+
+    Only face-on: a circle viewed edge-on projects to a line, and a cross there would be
+    read as geometry that is not in the part.
+    """
+    n = 0
+    for d in dims:
+        if d.kind not in ("diameter", "radius") or d.normal is None or d.centre is None:
+            continue
+        if abs(d.normal.normalized().dot(out_axis.normalized())) < 0.94:
+            continue
+        c = _project(scene, cam, d.centre, sheet.px_w, sheet.px_h)
+        edge = _project(scene, cam, d.centre + _perp(d.normal) * d.radius,
+                        sheet.px_w, sheet.px_h)
+        r_px = (edge - c).length
+        if r_px < sheet.px_w * 0.006:      # too small to read as anything but a smudge
+            continue
+        render.centre_mark(sheet, c.x, c.y, r_px)
+        n += 1
+    return n
+
+
+def _perp(v):
+    v = v.normalized()
+    other = Vector((0, 0, 1)) if abs(v.z) < 0.9 else Vector((1, 0, 0))
+    return v.cross(other).normalized()
 
 
 def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
@@ -406,7 +446,7 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
     t = sheet.theme
     px_w, px_h = sheet.px_w, sheet.px_h
     drawn = 0
-    ah = fs * 0.42
+    ah = fs * 0.30
 
     for d in dims:
         if d.kind == "perimeter":
@@ -422,10 +462,9 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
                                       lw, fs * 1.15, away.x, away.y, fs * 1.4 * step)
             if not ok:
                 continue
-            sheet.polyline([(c.x, c.y), (lx - away.x * lw * 0.3, ly)], t["faint"], 1.8)
-            sheet.polyline([(c.x, c.y), (c.x, c.y)], t["ink"], 3.0)
-            render.label_plate(sheet, lx, ly, d.label, fs)
-            sheet.text(lx, ly + fs * 0.33, d.label, fs, t["ink"], anchor="middle")
+            sheet.polyline([(c.x, c.y), (lx - away.x * lw * 0.3, ly)], t["thin"],
+                           sheet.w("leader"))
+            _dim_text(sheet, lx, ly, d.label, fs, t["ink"])
             drawn += 1
             continue
 
@@ -447,9 +486,9 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
             steps = max(6, int(abs(a2 - a1) * 14))
             arc = [(c.x + r * math.cos(a1 + (a2 - a1) * i / steps),
                     c.y + r * math.sin(a1 + (a2 - a1) * i / steps)) for i in range(steps + 1)]
-            sheet.polyline([(c.x, c.y), (a.x, a.y)], t["faint"], 1.5)
-            sheet.polyline([(c.x, c.y), (b.x, b.y)], t["faint"], 1.5)
-            sheet.polyline(arc, t["ink"], 2.0)
+            sheet.polyline([(c.x, c.y), (a.x, a.y)], t["thin"], sheet.w("ext"))
+            sheet.polyline([(c.x, c.y), (b.x, b.y)], t["thin"], sheet.w("ext"))
+            sheet.polyline(arc, t["ink"], sheet.w("dim"))
             mid = arc[len(arc) // 2]
             out = Vector((mid[0] - c.x, mid[1] - c.y))
             out = out.normalized() if out.length > 1e-6 else Vector((0, -1))
@@ -457,8 +496,7 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
             lx, ly, _ = placer.place(mid[0] + out.x * fs * 1.2 * offset,
                                      mid[1] + out.y * fs * 1.2 * offset,
                                      lw, fs * 1.15, out.x, out.y, fs * 1.1 * step)
-            render.label_plate(sheet, lx, ly, d.label, fs)
-            sheet.text(lx, ly + fs * 0.33, d.label, fs, t["ink"], anchor="middle")
+            _dim_text(sheet, lx, ly, d.label, fs, t["ink"])
             drawn += 1
             continue
 
@@ -480,16 +518,15 @@ def draw_dims(sheet, dims, scene, cam, fs, placer, model_bbox_px,
         da, db = a + off, b + off
 
         sheet.polyline([(a.x, a.y), (da.x + n.x * fs * 0.5, da.y + n.y * fs * 0.5)],
-                       t["faint"], 1.5)
+                       t["thin"], sheet.w("ext"))
         sheet.polyline([(b.x, b.y), (db.x + n.x * fs * 0.5, db.y + n.y * fs * 0.5)],
-                       t["faint"], 1.5)
-        sheet.polyline([(da.x, da.y), (db.x, db.y)], t["ink"], 2.0)
+                       t["thin"], sheet.w("ext"))
+        sheet.polyline([(da.x, da.y), (db.x, db.y)], t["ink"], sheet.w("dim"))
         u = (db - da).normalized()
         render.arrow(sheet, da.x, da.y, -u.x, -u.y, ah, t["ink"])
         render.arrow(sheet, db.x, db.y, u.x, u.y, ah, t["ink"])
 
-        render.label_plate(sheet, lx, ly, d.label, fs)
-        sheet.text(lx, ly + fs * 0.33, d.label, fs, t["ink"], anchor="middle")
+        _dim_text(sheet, lx, ly, d.label, fs, t["ink"])
 
         # Reserve the dimension LINE too, not just its label. Two dimensions can have
         # labels that clear each other while their lines lie on top of one another.

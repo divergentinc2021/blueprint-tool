@@ -11,7 +11,7 @@ the CLI cannot drift apart.
 bl_info = {
     "name": "Blueprint Tool",
     "author": "Laurent de Laroche Souvestre",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "doc_url": "https://github.com/divergentinc2021/blueprint-tool",
     "blender": (4, 5, 0),
     "location": "3D Viewport > Sidebar (N) > Blueprint",
@@ -52,14 +52,18 @@ PAGE_ITEMS = [
     ("a3p", "A3 Portrait", "297 x 420 mm"),
     ("a2l", "A2 Landscape", "594 x 420 mm"),
 ]
-THEME_ITEMS = [
-    ("white", "White", "Dark lines on white paper"),
-    ("blueprint", "Blueprint", "White lines on traditional blueprint blue"),
-    ("cyanotype", "Cyanotype", "White lines on deep Prussian blue, the classic print look"),
-    ("sepia", "Sepia", "Dark lines on aged parchment"),
-    ("steel", "Steel", "Light lines on gunmetal grey"),
-    ("dark", "Dark", "Light lines on near-black"),
-]
+# Built from render.THEMES so the two cannot drift: a hand-kept copy of this list already
+# went stale once, leaving a theme in the menu that no longer existed.
+THEME_DESCRIPTIONS = {
+    "white": "Dark lines on white paper",
+    "blueprint": "White lines on traditional blueprint blue",
+    "cyanotype": "White lines on deep Prussian blue, the classic print look",
+    "noir": "Fine light lines on near-black, technical-cover style",
+    "sepia": "Dark lines on aged parchment",
+    "steel": "Light lines on gunmetal grey",
+}
+THEME_ITEMS = [(k, render.THEMES[k]["label"], THEME_DESCRIPTIONS.get(k, ""))
+               for k in render.THEME_ORDER]
 LAYOUT_ITEMS = [
     ("sheet", "One Per Page", "A separate page for each view"),
     ("plate", "Single Plate", "Every view laid out on one sheet, poster style"),
@@ -78,6 +82,25 @@ KIND_ITEMS = [
     ("angle", "Angular", "Angle between two selected edges"),
     ("perimeter", "Perimeter", "Around a selected face or closed edge loop"),
 ]
+
+
+class BlueprintField(PropertyGroup):
+    """One title block row. An empty value is filled in from the drawing."""
+    label: StringProperty(name="Label", default="", update=lambda s, c: preview.mark_stale())
+    value: StringProperty(
+        name="Value", default="",
+        description="Leave blank to fill in from the drawing when the label is one of: "
+                    "View, Scale, Overall, Unit, Page, Date, Projection, Sheet, Drawn",
+        update=lambda s, c: preview.mark_stale())
+
+
+class BlueprintDetail(PropertyGroup):
+    """A detail callout: some objects, ringed on a parent view and enlarged beside it."""
+    name: StringProperty(name="Tag", default="A", update=lambda s, c: preview.mark_stale())
+    objects: StringProperty(name="Objects", default="",
+                            update=lambda s, c: preview.mark_stale())
+    on: StringProperty(name="On", default="front",
+                       update=lambda s, c: preview.mark_stale())
 
 
 class BlueprintObject(PropertyGroup):
@@ -161,6 +184,10 @@ class BlueprintSettings(PropertyGroup):
         description="Edges whose faces meet at an angle BELOW this become lines, in "
                     "degrees. Higher values draw more interior detail",
         default=140.0, min=0.0, max=180.0, update=_stale)
+    centre_marks: BoolProperty(
+        name="Centres",
+        description="Dash-dot cross through circular features the view sees face-on",
+        default=True, update=_stale)
     silhouette: BoolProperty(
         name="Silhouette",
         description="Add the true outline of curved surfaces. Line Art alone draws no "
@@ -213,6 +240,10 @@ class BlueprintSettings(PropertyGroup):
         default=False, update=_stale)
     objects: CollectionProperty(type=BlueprintObject)
     objects_index: IntProperty(default=0)
+    fields: CollectionProperty(type=BlueprintField)
+    fields_index: IntProperty(default=0)
+    details: CollectionProperty(type=BlueprintDetail)
+    details_index: IntProperty(default=0)
 
     dim_offset: FloatProperty(
         name="Offset", description="How far dimensions sit from the geometry",
@@ -223,6 +254,22 @@ class BlueprintSettings(PropertyGroup):
     dim_text: FloatProperty(
         name="Text Size", description="Dimension text size",
         default=1.0, min=0.4, max=3.0, update=_stale)
+
+    preview_size: FloatProperty(
+        name="Size", description="How much of the viewport the preview occupies",
+        default=0.42, min=0.15, max=1.0, subtype="FACTOR",
+        update=lambda s, c: preview.set_options(size=s.preview_size))
+    preview_corner: EnumProperty(
+        name="Corner", description="Where the preview sits in the viewport",
+        items=[("BOTTOM_RIGHT", "Bottom Right", ""), ("BOTTOM_LEFT", "Bottom Left", ""),
+               ("TOP_RIGHT", "Top Right", ""), ("TOP_LEFT", "Top Left", ""),
+               ("CENTER", "Centre", "")],
+        default="BOTTOM_RIGHT",
+        update=lambda s, c: preview.set_options(corner=s.preview_corner))
+    preview_opacity: FloatProperty(
+        name="Opacity", description="Fade the preview back over the model",
+        default=1.0, min=0.15, max=1.0, subtype="FACTOR",
+        update=lambda s, c: preview.set_options(opacity=s.preview_opacity))
 
     preview_view: EnumProperty(
         name="Preview",
@@ -260,6 +307,13 @@ def _opts(s, views):
         dim_objects_only=([i.name for i in s.objects if i.use]
                           if s.use_object_filter else None),
         dim_offset=s.dim_offset, dim_step=s.dim_step, dim_text=s.dim_text,
+        centre_marks=s.centre_marks,
+        fields=([(f.label, f.value or None) for f in s.fields if f.label.strip()]
+                or None),
+        details=([{"name": dt.name,
+                   "objects": [n.strip() for n in dt.objects.split(",") if n.strip()],
+                   "on": dt.on}
+                  for dt in s.details if dt.objects.strip()] or None),
         dim_kinds=(kinds if len(kinds) < len(KIND_ITEMS) else None),
     )
 
@@ -313,6 +367,77 @@ class BLUEPRINT_OT_object_ticks(Operator):
                 item.use = False
             else:
                 item.use = item.name in selected
+        preview.mark_stale()
+        return {"FINISHED"}
+
+
+class BLUEPRINT_UL_fields(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.prop(item, "label", text="", emboss=False)
+        sub = row.row(align=True)
+        auto = item.label.strip().lower() in core.AUTO_FIELDS and not item.value
+        sub.prop(item, "value", text="",
+                 placeholder="auto" if auto else "")
+
+
+class BLUEPRINT_UL_details(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.prop(item, "name", text="")
+        row.prop(item, "objects", text="")
+
+
+class BLUEPRINT_OT_fields(Operator):
+    bl_idname = "blueprint.fields"
+    bl_label = "Title Block Fields"
+    bl_description = "Add, remove or reset the title block rows"
+
+    action: StringProperty(default="add")
+
+    def execute(self, context):
+        s = context.scene.blueprint
+        if self.action == "add":
+            f = s.fields.add()
+            f.label, f.value = "Label", ""
+            s.fields_index = len(s.fields) - 1
+        elif self.action == "remove" and s.fields:
+            s.fields.remove(s.fields_index)
+            s.fields_index = max(0, s.fields_index - 1)
+        elif self.action == "reset":
+            s.fields.clear()
+            for label, _v in core.default_fields():
+                f = s.fields.add()
+                f.label, f.value = label, ""
+        preview.mark_stale()
+        return {"FINISHED"}
+
+
+class BLUEPRINT_OT_details(Operator):
+    bl_idname = "blueprint.details"
+    bl_label = "Detail Callouts"
+    bl_description = "Add a detail from the selected objects, or remove one"
+
+    action: StringProperty(default="add")
+
+    def execute(self, context):
+        s = context.scene.blueprint
+        if self.action == "add":
+            picked = [o.name for o in context.selected_objects if o.type == "MESH"]
+            if not picked:
+                self.report({"ERROR"}, "Select the objects the detail should enlarge")
+                return {"CANCELLED"}
+            used = {d.name for d in s.details}
+            tag = next(c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if c not in used)
+            d = s.details.add()
+            d.name, d.objects = tag, ",".join(picked)
+            d.on = next((v for v in core.VIEW_ORDER if getattr(s, "view_" + v)), "front")
+            s.details_index = len(s.details) - 1
+            self.report({"INFO"}, "Detail %s: %d object%s"
+                        % (tag, len(picked), "" if len(picked) == 1 else "s"))
+        elif self.action == "remove" and s.details:
+            s.details.remove(s.details_index)
+            s.details_index = max(0, s.details_index - 1)
         preview.mark_stale()
         return {"FINISHED"}
 
@@ -410,6 +535,8 @@ class BLUEPRINT_OT_preview_refresh(Operator):
         if sheet is None:
             self.report({"ERROR"}, "Preview produced nothing")
             return {"CANCELLED"}
+        preview.set_options(size=s.preview_size, corner=s.preview_corner,
+                            opacity=s.preview_opacity)
         preview.set_sheet(sheet, s.preview_view)
         if not preview.is_enabled():
             preview.enable()
@@ -553,6 +680,8 @@ class BLUEPRINT_PT_main(Panel):
         row.prop(s, "grid", toggle=True)
         row = layout.row(align=True)
         row.prop(s, "dims", toggle=True)
+        row.prop(s, "centre_marks", toggle=True)
+        row = layout.row(align=True)
         row.prop(s, "pdf", toggle=True)
         row.prop(s, "png", toggle=True)
 
@@ -672,6 +801,56 @@ class BLUEPRINT_PT_objects(Panel):
             box.label(text="Measuring %d of %d" % (n_on, n_scene), icon="CHECKMARK")
 
 
+class BLUEPRINT_PT_sheet(Panel):
+    bl_label = "Title Block"
+    bl_idname = "BLUEPRINT_PT_sheet"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Blueprint"
+    bl_parent_id = "BLUEPRINT_PT_main"
+
+    def draw(self, context):
+        s = context.scene.blueprint
+        layout = self.layout
+        layout.prop(s, "title")
+        if not len(s.fields):
+            layout.operator(BLUEPRINT_OT_fields.bl_idname, text="Add Default Rows",
+                            icon="PRESET").action = "reset"
+            layout.label(text="Using the default rows", icon="INFO")
+            return
+        row = layout.row()
+        row.template_list("BLUEPRINT_UL_fields", "", s, "fields", s, "fields_index", rows=5)
+        col = row.column(align=True)
+        col.operator(BLUEPRINT_OT_fields.bl_idname, text="", icon="ADD").action = "add"
+        col.operator(BLUEPRINT_OT_fields.bl_idname, text="", icon="REMOVE").action = "remove"
+        col.separator()
+        col.operator(BLUEPRINT_OT_fields.bl_idname, text="", icon="LOOP_BACK").action = "reset"
+        layout.label(text="Blank value = filled in from the drawing")
+
+
+class BLUEPRINT_PT_details(Panel):
+    bl_label = "Detail Callouts"
+    bl_idname = "BLUEPRINT_PT_details"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Blueprint"
+    bl_parent_id = "BLUEPRINT_PT_main"
+
+    def draw(self, context):
+        s = context.scene.blueprint
+        layout = self.layout
+        row = layout.row()
+        row.template_list("BLUEPRINT_UL_details", "", s, "details", s, "details_index",
+                          rows=3)
+        col = row.column(align=True)
+        col.operator(BLUEPRINT_OT_details.bl_idname, text="", icon="ADD").action = "add"
+        col.operator(BLUEPRINT_OT_details.bl_idname, text="", icon="REMOVE").action = "remove"
+        if len(s.details):
+            d = s.details[min(s.details_index, len(s.details) - 1)]
+            layout.prop(d, "on", text="Ring on view")
+        layout.label(text="Add rings the selected objects", icon="INFO")
+
+
 class BLUEPRINT_PT_preview(Panel):
     bl_label = "Preview"
     bl_idname = "BLUEPRINT_PT_preview"
@@ -686,11 +865,23 @@ class BLUEPRINT_PT_preview(Panel):
         st = preview.status()
 
         layout.prop(s, "preview_view", text="")
-        row = layout.row(align=True)
-        row.operator(BLUEPRINT_OT_preview_refresh.bl_idname, icon="FILE_REFRESH")
+        layout.operator(BLUEPRINT_OT_preview_refresh.bl_idname, icon="FILE_REFRESH")
+
+        # A labelled button, not a bare icon: the overlay draws over the viewport and the
+        # way out has to be obvious.
+        on = preview.is_enabled()
+        row = layout.row()
+        row.scale_y = 1.3
+        row.alert = on
         row.operator(BLUEPRINT_OT_preview_toggle.bl_idname,
-                     text="", icon="HIDE_OFF" if preview.is_enabled() else "HIDE_ON",
-                     depress=preview.is_enabled())
+                     text="Hide Preview" if on else "Show Preview",
+                     icon="HIDE_ON" if on else "HIDE_OFF")
+
+        col = layout.column(align=True)
+        col.enabled = on
+        col.prop(s, "preview_size", slider=True)
+        col.prop(s, "preview_opacity", slider=True)
+        col.prop(s, "preview_corner", text="")
 
         if not st["has"]:
             layout.label(text="Nothing previewed yet", icon="INFO")
@@ -701,14 +892,16 @@ class BLUEPRINT_PT_preview(Panel):
         layout.label(text="Hidden lines show translucent, not dashed")
 
 
-CLASSES = (BlueprintPrefs, BlueprintObject, BlueprintSettings, BLUEPRINT_UL_objects,
+CLASSES = (BlueprintPrefs, BlueprintField, BlueprintDetail, BlueprintObject,
+           BlueprintSettings, BLUEPRINT_UL_objects, BLUEPRINT_UL_fields,
+           BLUEPRINT_UL_details, BLUEPRINT_OT_fields, BLUEPRINT_OT_details,
            BLUEPRINT_OT_sync_objects, BLUEPRINT_OT_object_ticks,
            BLUEPRINT_OT_import, BLUEPRINT_OT_generate,
            BLUEPRINT_OT_preview_refresh, BLUEPRINT_OT_preview_toggle,
            BLUEPRINT_OT_open_output, BLUEPRINT_OT_set_views,
            BLUEPRINT_OT_check_updates, BLUEPRINT_OT_open_url,
            BLUEPRINT_PT_main, BLUEPRINT_PT_dimensions, BLUEPRINT_PT_objects,
-           BLUEPRINT_PT_preview)
+           BLUEPRINT_PT_sheet, BLUEPRINT_PT_details, BLUEPRINT_PT_preview)
 
 
 def register():

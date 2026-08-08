@@ -15,63 +15,56 @@ import math
 import zlib
 
 # ---------------------------------------------------------------- themes
+# Every theme names the same roles, so a drawing keeps its meaning when the paper changes:
+# ink carries the object, hidden what is behind it, thin the measuring apparatus, and grid
+# the paper itself. accent is used once per sheet, on the detail callouts, so an enlargement
+# reads as a reference rather than as more geometry.
 THEMES = {
     "white": dict(
         label="White",
-        bg="#ffffff",
-        ink="#1a2b4c",        # linework, dimension lines, text
-        faint="#8a97ad",      # extension lines, hidden lines, secondary text
-        hidden="#8a97ad",
-        frame="#1a2b4c",
-        grid="#dfe4ec",       # graticule, barely there
+        bg="#ffffff", ink="#12203a", hidden="#7d8ba3", thin="#5b6982",
+        frame="#12203a", grid="#dbe2ed", accent="#a8442a", faint="#8a97ad",
     ),
     "blueprint": dict(
         label="Blueprint",
-        bg="#12386e",
-        ink="#ffffff",
-        faint="#9dc4ef",
-        hidden="#9dc4ef",
-        frame="#ffffff",
-        grid="#1d4c8a",
+        bg="#0f3a72", ink="#ffffff", hidden="#8fb6e4", thin="#bcd6f2",
+        frame="#ffffff", grid="#1d5493", accent="#ffc65c", faint="#9dc4ef",
     ),
     "cyanotype": dict(
         label="Cyanotype",
-        bg="#0b3d62",         # deeper Prussian blue, the classic print look
-        ink="#f2f7fb",
-        faint="#7fb2d9",
-        hidden="#5d93bd",
-        frame="#f2f7fb",
-        grid="#154f7c",
+        bg="#08324f", ink="#eaf4fb", hidden="#6fa3c9", thin="#a9cde6",
+        frame="#eaf4fb", grid="#124d78", accent="#f0b455", faint="#7fb2d9",
+    ),
+    "noir": dict(
+        label="Noir",
+        bg="#08090b", ink="#f4f6f8", hidden="#5f6873", thin="#9aa4b2",
+        frame="#f4f6f8", grid="#20262e", accent="#5ad1e6", faint="#7d8794",
     ),
     "sepia": dict(
         label="Sepia",
-        bg="#e8dcc0",         # aged parchment
-        ink="#3a2f22",
-        faint="#8a7a5e",
-        hidden="#a2937a",
-        frame="#3a2f22",
-        grid="#d6c8a6",
+        bg="#ece0c6", ink="#2f2618", hidden="#9b8a6c", thin="#6d5f47",
+        frame="#2f2618", grid="#ddceac", accent="#8c3a1e", faint="#8a7a5e",
     ),
     "steel": dict(
         label="Steel",
-        bg="#3d4348",
-        ink="#eef1f3",
-        faint="#9aa4ab",
-        hidden="#7f8a92",
-        frame="#eef1f3",
-        grid="#4a5157",
-    ),
-    "dark": dict(
-        label="Dark",
-        bg="#14161a",
-        ink="#e8ecf2",
-        faint="#7d8794",
-        hidden="#7d8794",
-        frame="#e8ecf2",
-        grid="#22262c",
+        bg="#363c42", ink="#f2f5f7", hidden="#7d8892", thin="#aeb7c0",
+        frame="#f2f5f7", grid="#4d555e", accent="#ffb648", faint="#9aa4ab",
     ),
 }
-THEME_ORDER = ["white", "blueprint", "cyanotype", "sepia", "steel", "dark"]
+THEME_ORDER = ["white", "blueprint", "cyanotype", "noir", "sepia", "steel"]
+
+# Line weights in REAL MILLIMETRES, following the drafting convention that weight encodes
+# meaning: the object outline is heaviest, hidden detail lighter, the measuring apparatus
+# lighter still, and the paper grid barely there. Pixel constants cannot do this, because
+# the same value means a different physical line on A4 and A2.
+WEIGHTS_MM = dict(
+    frame=0.70, frame_inner=0.25,
+    outline=0.50, hidden=0.30, centre=0.18,
+    dim=0.20, ext=0.13, leader=0.18,
+    grid=0.09, grid_major=0.13,
+    block=0.50, block_rule=0.13,
+    detail=0.35,
+)
 
 
 def hex_rgb(h):
@@ -90,6 +83,14 @@ class Sheet:
         self.theme_name = theme
         self.ops = []
 
+    @property
+    def px_per_mm(self):
+        return self.px_w / float(self.mm_w)
+
+    def w(self, role):
+        """Line weight for a drafting role, in pixels for this sheet's real page size."""
+        return max(WEIGHTS_MM[role] * self.px_per_mm, 0.6)
+
     # -- primitives
     def rect(self, x, y, w, h, fill=None, stroke=None, width=2.0):
         self.ops.append(("rect", x, y, w, h, fill, stroke, width))
@@ -105,9 +106,10 @@ class Sheet:
         if len(pts) >= 3:
             self.ops.append(("polygon", list(pts), fill))
 
-    def text(self, x, y, s, size, fill, anchor="start", bold=False, rotate=0):
+    def text(self, x, y, s, size, fill, anchor="start", bold=False, rotate=0, track=0.0):
         """anchor: start | middle | end. rotate: 0 or 90 (90 reads bottom-to-top)."""
-        self.ops.append(("text", x, y, ascii_only(s), size, fill, anchor, bold, rotate))
+        self.ops.append(("text", x, y, ascii_only(s), size, fill, anchor, bold, rotate,
+                         track))
 
 
     def blit(self, other, dx, dy):
@@ -125,8 +127,60 @@ class Sheet:
                 _, pts, fill = op
                 self.ops.append(("polygon", [(p[0] + dx, p[1] + dy) for p in pts], fill))
             elif k == "text":
-                _, x, y, t, size, fill, anchor, bold, rotate = op
-                self.ops.append(("text", x + dx, y + dy, t, size, fill, anchor, bold, rotate))
+                _, x, y, t, size, fill, anchor, bold, rotate, track = op
+                self.ops.append(("text", x + dx, y + dy, t, size, fill, anchor, bold,
+                                 rotate, track))
+
+
+def clip_polyline(pts, x0, y0, x1, y1):
+    """
+    Liang-Barsky clip of a polyline to a rectangle, returning the surviving runs.
+
+    An enlarged detail frames a region, but Line Art still hands back every stroke in the
+    scene, so without this the geometry outside the region runs across the whole sheet.
+    """
+    out, run = [], []
+    for i in range(len(pts) - 1):
+        seg = _clip_segment(pts[i], pts[i + 1], x0, y0, x1, y1)
+        if seg is None:
+            if len(run) > 1:
+                out.append(run)
+            run = []
+            continue
+        a, b = seg
+        if run and abs(run[-1][0] - a[0]) < 1e-6 and abs(run[-1][1] - a[1]) < 1e-6:
+            run.append(b)
+        else:
+            if len(run) > 1:
+                out.append(run)
+            run = [a, b]
+    if len(run) > 1:
+        out.append(run)
+    return out
+
+
+def _clip_segment(a, b, x0, y0, x1, y1):
+    """Canonical Liang-Barsky. Returns the clipped endpoints, or None if fully outside."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t0, t1 = 0.0, 1.0
+    for pk, qk in ((-dx, a[0] - x0), (dx, x1 - a[0]),
+                   (-dy, a[1] - y0), (dy, y1 - a[1])):
+        if pk == 0:
+            if qk < 0:
+                return None          # parallel to this edge and outside it
+            continue
+        r = qk / pk
+        if pk < 0:
+            if r > t1:
+                return None
+            t0 = max(t0, r)
+        else:
+            if r < t0:
+                return None
+            t1 = min(t1, r)
+    if t0 > t1:
+        return None
+    return ((a[0] + dx * t0, a[1] + dy * t0), (a[0] + dx * t1, a[1] + dy * t1))
 
 
 def ascii_only(s):
@@ -157,23 +211,25 @@ def fmt(value, unit):
     return "%.3f" % value
 
 
-def text_width(s, size, bold=False):
+def text_width(s, size, bold=False, track=0.0):
     total = 0
     for ch in str(s):
         o = ord(ch)
         total += _HELV[o - 32] if 32 <= o <= 126 else 556
     w = total / 1000.0 * size
-    return w * 1.06 if bold else w
+    if bold:
+        w *= 1.06
+    return w + track * max(len(str(s)) - 1, 0)
 
 
-def fit_text(s, size, avail, min_size, bold=False):
+def fit_text(s, size, avail, min_size, bold=False, track=0.0):
     """Shrink, then truncate, so a long string cannot escape its box."""
-    while size > min_size and text_width(s, size, bold) > avail:
+    while size > min_size and text_width(s, size, bold, track) > avail:
         size *= 0.94
-    if text_width(s, size, bold) <= avail:
+    if text_width(s, size, bold, track) <= avail:
         return s, size
     out = s
-    while out and text_width(out + "...", size, bold) > avail:
+    while out and text_width(out + "...", size, bold, track) > avail:
         out = out[:-1]
     return (out + "...") if out else s[:1], size
 
@@ -212,12 +268,14 @@ def to_svg(sheet):
             out.append('<polygon points="%s" fill="%s" stroke="none"/>'
                        % (" ".join("%.1f,%.1f" % p for p in pts), fill))
         elif k == "text":
-            _, x, y, s, size, fill, anchor, bold, rotate = op
+            _, x, y, s, size, fill, anchor, bold, rotate, track = op
             a = {"start": "start", "middle": "middle", "end": "end"}[anchor]
             attrs = ('font-family="Helvetica,Arial,sans-serif" font-size="%.1f" fill="%s" '
                      'text-anchor="%s"' % (size, fill, a))
             if bold:
                 attrs += ' font-weight="700"'
+            if track:
+                attrs += ' letter-spacing="%.2f"' % track
             if rotate:
                 out.append('<text x="0" y="0" %s transform="translate(%.1f,%.1f) '
                            'rotate(-90)">%s</text>' % (attrs, x, y, _esc(s)))
@@ -285,19 +343,22 @@ def _sheet_content(sheet):
                 o.append("%.3f %.3f l" % (X(p[0]), Y(p[1])))
             o.append("h f")
         elif k == "text":
-            _, x, y, s, size, fill, anchor, bold, rotate = op
+            _, x, y, s, size, fill, anchor, bold, rotate, track = op
             fsize = size * sy
-            w = text_width(s, fsize, bold)
+            tr = track * sx
+            w = text_width(s, fsize, bold, tr)
             # PDF has no text anchor; shift the origin by the measured width instead
             off = 0.0 if anchor == "start" else (-w / 2.0 if anchor == "middle" else -w)
             o.append("BT")
             o.append("/%s %.3f Tf" % ("FB" if bold else "FR", fsize))
+            o.append("%.3f Tc" % tr)
             o.append("%s rg" % _pdf_colour(fill))
             if rotate:  # reads bottom-to-top; PDF is y-up so this is +90 degrees
                 o.append("0 1 -1 0 %.3f %.3f Tm" % (X(x), Y(y) + off))
             else:
                 o.append("1 0 0 1 %.3f %.3f Tm" % (X(x) + off, Y(y)))
             o.append("%s Tj" % _pdf_str(s))
+            o.append("0 Tc")
             o.append("ET")
     o.append("Q")
     return "\n".join(o).encode("latin-1", "replace")
@@ -366,75 +427,166 @@ def write_pdf(path, sheets, title="Blueprint", compress=True):
 
 # ---------------------------------------------------------------- shared furniture
 def draw_frame(sheet, fs):
+    """
+    Sheet border: a light trim rule at the paper edge and a heavy drawing border inside it.
+
+    A single rule reads as a box drawn on a page. The pair reads as a sheet with a drawing
+    area, which is what it is, and it gives the title block something to sit against.
+    """
     t = sheet.theme
+    mm = sheet.px_per_mm
     sheet.rect(0, 0, sheet.px_w, sheet.px_h, fill=t["bg"])
-    sheet.rect(fs, fs, sheet.px_w - 2 * fs, sheet.px_h - 2 * fs,
-               fill=None, stroke=t["frame"], width=3)
+    trim = 4.0 * mm
+    border = 9.0 * mm
+    sheet.rect(trim, trim, sheet.px_w - 2 * trim, sheet.px_h - 2 * trim,
+               fill=None, stroke=t["grid"], width=sheet.w("frame_inner"))
+    sheet.rect(border, border, sheet.px_w - 2 * border, sheet.px_h - 2 * border,
+               fill=None, stroke=t["frame"], width=sheet.w("frame"))
+    return border
 
 
 def draw_grid(sheet, fs, step_mm=10.0, bold_every=5):
     """Faint graticule, the hallmark of blueprint paper. Spacing is in real millimetres."""
     t = sheet.theme
-    colour = t.get("grid", t["faint"])
-    px_per_mm = sheet.px_w / sheet.mm_w
-    step = step_mm * px_per_mm
+    mm = sheet.px_per_mm
+    step = step_mm * mm
     if step < 6:                      # denser than this just muddies the page
         return
-    inset = fs
-    i = 0
-    x = inset
-    while x <= sheet.px_w - inset:
-        sheet.line(x, inset, x, sheet.px_h - inset, colour,
-                   1.6 if (i % bold_every == 0) else 0.8)
-        x += step
-        i += 1
-    i = 0
-    y = inset
-    while y <= sheet.px_h - inset:
-        sheet.line(inset, y, sheet.px_w - inset, y, colour,
-                   1.6 if (i % bold_every == 0) else 0.8)
-        y += step
-        i += 1
+    inset = 9.0 * mm
+    for axis in (0, 1):
+        limit = (sheet.px_w if axis == 0 else sheet.px_h) - inset
+        i, v = 0, inset
+        while v <= limit:
+            major = (i % bold_every == 0)
+            colour = t["grid"]
+            width = sheet.w("grid_major" if major else "grid")
+            if axis == 0:
+                sheet.line(v, inset, v, sheet.px_h - inset, colour, width)
+            else:
+                sheet.line(inset, v, sheet.px_w - inset, v, colour, width)
+            v += step
+            i += 1
 
 
-def draw_title_block(sheet, fs, rows):
+def caption(sheet, cx, y, text, fs, sub=None):
+    """View name under a drawing, in the drafting idiom: spaced caps with a short rule."""
     t = sheet.theme
-    bw, bh = fs * 20.0, fs * (1.6 + 1.35 * len(rows))
-    x, y = sheet.px_w - bw - fs * 1.6, sheet.px_h - bh - fs * 1.6
-    sheet.rect(x, y, bw, bh, fill=t["bg"], stroke=t["frame"], width=2.5)
-    ty = y + fs * 1.5
-    for i, (k, v) in enumerate(rows):
-        if i == 0:
-            shown, size = fit_text(str(v), fs * 1.05, bw - fs * 1.4, fs * 0.62, bold=True)
-            sheet.text(x + fs * 0.7, ty, shown, size, t["ink"], bold=True)
-            sheet.line(x, ty + fs * 0.45, x + bw, ty + fs * 0.45, t["frame"], 1.5)
-            ty += fs * 1.75
-            continue
-        sheet.text(x + fs * 0.7, ty, k, fs * 0.8, t["faint"])
-        shown, size = fit_text(str(v), fs * 0.8, bw - fs * 1.4 - text_width(k, fs * 0.8),
-                               fs * 0.55)
-        sheet.text(x + bw - fs * 0.7, ty, shown, size, t["ink"], anchor="end")
-        ty += fs * 1.35
+    size = fs * 0.82
+    track = size * 0.16
+    w = text_width(text.upper(), size, True, track)
+    sheet.text(cx, y, text.upper(), size, t["ink"], anchor="middle", bold=True, track=track)
+    sheet.line(cx - w / 2.0, y + size * 0.42, cx + w / 2.0, y + size * 0.42,
+               t["ink"], sheet.w("centre"))
+    if sub:
+        sheet.text(cx, y + size * 1.6, sub, size * 0.82, t["thin"], anchor="middle",
+                   track=size * 0.1)
+
+
+def centre_mark(sheet, cx, cy, radius, colour=None):
+    """Dash-dot cross through a circular feature, as a drawing would carry."""
+    t = sheet.theme
+    r = radius * 1.22
+    gap, dash, dot = r * 0.10, r * 0.42, r * 0.06
+    w = sheet.w("centre")
+    c = colour or t["thin"]
+    for dx, dy in ((1, 0), (0, 1)):
+        for sgn in (1, -1):
+            x0 = cx + dx * sgn * gap
+            y0 = cy + dy * sgn * gap
+            sheet.polyline([(x0, y0), (x0 + dx * sgn * dash, y0 + dy * sgn * dash)], c, w)
+            s0 = gap + dash + gap
+            sheet.polyline([(cx + dx * sgn * s0, cy + dy * sgn * s0),
+                            (cx + dx * sgn * (s0 + dot), cy + dy * sgn * (s0 + dot))], c, w)
+
+
+def detail_callout(sheet, cx, cy, r, tag, fs):
+    """Ring the enlarged region and letter it, so the inset reads as a reference."""
+    t = sheet.theme
+    steps = 48
+    ring = [(cx + r * math.cos(2 * math.pi * i / steps),
+             cy + r * math.sin(2 * math.pi * i / steps)) for i in range(steps + 1)]
+    sheet.polyline(ring, t["accent"], sheet.w("detail"), dash=(r * 0.16, r * 0.10))
+    # leader out to the upper right, then a short horizontal shoulder to carry the letter
+    a = math.radians(-38)
+    ex, ey = cx + r * math.cos(a), cy + r * math.sin(a)
+    lx, ly = ex + fs * 1.5, ey - fs * 1.1
+    sheet.polyline([(ex, ey), (lx, ly), (lx + fs * 0.8, ly)], t["accent"], sheet.w("leader"))
+    sheet.text(lx + fs * 1.05, ly + fs * 0.34, tag.upper(), fs * 1.0, t["accent"],
+               bold=True, track=fs * 0.06)
+
+
+def title_block_height(fs, n_fields):
+    """Height the block will occupy, so a layout can reserve exactly that and no more."""
+    return fs * 2.6 + fs * 2.0 * ((max(n_fields, 1) + 1) // 2)
+
+
+def draw_title_block(sheet, fs, rows, title=None):
+    """
+    Title block: a heading band over a two-column field grid.
+
+    Fields are (label, value) pairs supplied by the caller, so the sheet can carry whatever
+    the drawing actually needs — drawing number, revision, material, client — rather than a
+    fixed set baked in here.
+    """
+    t = sheet.theme
+    mm = sheet.px_per_mm
+    border = 9.0 * mm
+    pairs = [(k, v) for k, v in rows if k]
+    heading = title if title is not None else next((v for k, v in rows if not k), "")
+
+    bw = fs * 22.0
+    head_h = fs * 2.6
+    # the label sits above its value inside one cell, so the row has to clear both
+    # baselines plus the value's descender - 1.5 put them on top of each other
+    row_h = fs * 2.0
+    n_rows = (len(pairs) + 1) // 2
+    bh = head_h + row_h * n_rows
+    x = sheet.px_w - border - bw
+    y = sheet.px_h - border - bh
+
+    sheet.rect(x, y, bw, bh, fill=t["bg"], stroke=t["frame"], width=sheet.w("block"))
+    sheet.line(x, y + head_h, x + bw, y + head_h, t["frame"], sheet.w("block"))
+
+    shown, size = fit_text(str(heading).upper(), fs * 1.32, bw - fs * 1.6, fs * 0.72,
+                           bold=True, track=fs * 0.05)
+    sheet.text(x + fs * 0.8, y + head_h * 0.66, shown, size, t["ink"], bold=True,
+               track=fs * 0.05)
+
+    half = bw / 2.0
+    for i, (k, v) in enumerate(pairs):
+        r, c = divmod(i, 2)
+        cx = x + c * half
+        cy = y + head_h + r * row_h
+        if c == 1:
+            sheet.line(cx, cy, cx, cy + row_h, t["frame"], sheet.w("block_rule"))
+        if r:
+            sheet.line(x, cy, x + bw, cy, t["frame"], sheet.w("block_rule"))
+        sheet.text(cx + fs * 0.5, cy + row_h * 0.38, str(k).upper(), fs * 0.58, t["thin"],
+                   track=fs * 0.08)
+        val, vsize = fit_text(str(v), fs * 0.84, half - fs * 1.0, fs * 0.5)
+        sheet.text(cx + fs * 0.5, cy + row_h * 0.84, val, vsize, t["ink"])
     return (x, y, bw, bh)
 
 
 def arrow(sheet, x, y, dx, dy, size, fill):
-    """Solid arrowhead at (x, y) pointing along (dx, dy)."""
+    """Slender filled arrowhead at (x, y) pointing along (dx, dy)."""
     px, py = -dy, dx
     sheet.polygon([(x, y),
-                   (x - dx * size * 2 + px * size * 0.5, y - dy * size * 2 + py * size * 0.5),
-                   (x - dx * size * 2 - px * size * 0.5, y - dy * size * 2 - py * size * 0.5)],
+                   (x - dx * size * 2.6 + px * size * 0.42,
+                    y - dy * size * 2.6 + py * size * 0.42),
+                   (x - dx * size * 2.6 - px * size * 0.42,
+                    y - dy * size * 2.6 - py * size * 0.42)],
                   fill)
 
 
-def label_plate(sheet, cx, cy, s, size, rotate=0):
+def label_plate(sheet, cx, cy, s, size, rotate=0, track=0.0):
     """Punch the background behind a label so the dimension line does not run through it."""
-    w = text_width(s, size) + size * 0.7
-    h = size * 1.15
+    w = text_width(s, size, False, track) + size * 0.8
+    h = size * 1.2
     if rotate:
         sheet.rect(cx - h * 0.5, cy - w * 0.5, h, w, fill=sheet.theme["bg"])
     else:
-        sheet.rect(cx - w * 0.5, cy - h * 0.62, w, h, fill=sheet.theme["bg"])
+        sheet.rect(cx - w * 0.5, cy - h * 0.64, w, h, fill=sheet.theme["bg"])
 
 
 def hypot(ax, ay, bx, by):

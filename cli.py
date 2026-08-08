@@ -87,7 +87,41 @@ def parse_args():
                    help="comma list limiting dimension kinds: " + ",".join(__import__(
                        "blueprint_tool.annotate", fromlist=["KINDS"]).KINDS))
     p.add_argument("--title", default=None)
+    p.add_argument("--field", action="append", default=None, metavar="LABEL=VALUE",
+                   help="title block field; repeatable. An empty value is filled in from "
+                        "the drawing (View, Scale, Overall, Unit, Page, Date, Projection, "
+                        "Sheet, Drawn). Example: --field 'Drawing No=UIZ-014'")
+    p.add_argument("--detail", action="append", default=None, metavar="NAME=OBJ,OBJ",
+                   help="detail callout; repeatable. Rings those objects on the parent "
+                        "view and adds an enlarged view. Example: --detail 'A=Wheel,Hub'")
+    p.add_argument("--detail-on", default=None,
+                   help="which view carries the callouts (default: the first view)")
+    p.add_argument("--no-centre-marks", action="store_true",
+                   help="omit dash-dot crosses through circular features")
     return p.parse_args(argv)
+
+
+def _fields(raw):
+    """--field 'Label=Value' pairs, order preserved. Empty value means auto-filled."""
+    if not raw:
+        return None
+    out = []
+    for item in raw:
+        label, _, value = item.partition("=")
+        out.append((label.strip(), value.strip() or None))
+    return out
+
+
+def _details(raw, on):
+    if not raw:
+        return None
+    out = []
+    for item in raw:
+        name, _, objs = item.partition("=")
+        out.append({"name": name.strip(),
+                    "objects": [n.strip() for n in objs.split(",") if n.strip()],
+                    "on": on})
+    return out
 
 
 def main():
@@ -108,6 +142,8 @@ def main():
             dim_objects_only=([n.strip() for n in a.only.split(",")] if a.only else None),
             dim_offset=a.dim_offset, dim_step=a.dim_step, dim_text=a.dim_text,
             dim_kinds=([k.strip() for k in a.kinds.split(",")] if a.kinds else None),
+            centre_marks=not a.no_centre_marks,
+            fields=_fields(a.field), details=_details(a.detail, a.detail_on),
         )
     except ValueError as e:
         raise SystemExit("error: %s" % e)
