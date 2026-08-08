@@ -193,7 +193,7 @@
       "dimensioned_height_mm": 640.6214
     }
   },
-  "output_dir": "/private/tmp/claude-502/-Volumes-Data-UIH-MacBookPro-LDLS-AMANZI-paris-workshop/919b46ed-d34d-4b03-85b4-9a733f66f478/scratchpad/ex2",
+  "output_dir": "examples/",
   "theme": "white",
   "layout": "sheet",
   "pdf": null,
