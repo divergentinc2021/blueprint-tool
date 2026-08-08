@@ -17,17 +17,17 @@ drawings out — hidden-line removed, dimensioned, with a title block, as SVG an
 Press **N** in the 3D viewport and choose the **Blueprint** tab. Needs Blender 4.5 or
 newer; nothing else to install. Same on macOS and Windows.
 
-> This repository is private, so the release link needs a GitHub login with access to it.
+### Updating
 
-**Updating is manual.** Blender copies the add-on into its own scripts folder, so the
-installed copy is a snapshot and a new release does not reach it. Download the new zip and
-Install from Disk again — it overwrites cleanly, no need to uninstall first.
+**Updates are manual.** Blender copies the add-on into its own scripts folder, so the
+installed copy is a snapshot and publishing a release does not reach it. Download the new
+zip and Install from Disk again — it overwrites cleanly, no need to uninstall first.
 
-The panel has a **Check for Updates** button that compares the running version against a
-release feed and shows a banner when a newer one exists. It respects Blender's *Allow
-Online Access* policy (Preferences ▸ System), which is off by default, and it needs a feed
-it can read without credentials — against a private repository the GitHub API answers 404.
-Set the feed URL in the add-on preferences.
+The panel shows the running version with a **Check for Updates** button beside it, and
+raises a banner with a download link when a newer release exists. It respects Blender's
+*Allow Online Access* policy (Preferences ▸ System), which is **off by default** — with it
+off the add-on says so rather than reaching the network anyway. The feed URL is
+configurable in the add-on preferences if you would rather point it somewhere else.
 
 ## Using it
 
