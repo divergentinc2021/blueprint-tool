@@ -1,0 +1,28 @@
+{
+  "prompt": "Technical engineering blueprint sheet of a 1999 Nissan Skyline GT-R R34 coupe, early first-year production model. Classic cyanotype blueprint style: deep Prussian blue paper with crisp thin white line-art drawings, subtle paper grain and faint white grid. Orthographic multi-view layout: large side elevation at top left, front elevation and rear elevation stacked at the right, top plan view along the bottom left. Accurate R34 proportions: boxy angular body, twin rectangular headlamps, hood vents on bonnet, four round tail lamps, large adjustable rear wing, flared wheel arches, 18-inch five-spoke wheels, side skirts, front lip spoiler. Fine dimension lines with arrowheads, extension lines, centerlines, section markers, small hatching. Title block in the lower right corner containing exactly the text 'NISSAN SKYLINE GT-R' on the first line, 'R34 - 1999' on the second line, and 'SCALE 1:20' on the third line, in clean uppercase drafting lettering, legible and correctly spelled. Dimension labels showing '4600' for overall length, '1785' for width, '1360' for height, '2665' for wheelbase. Flat 2D drafting drawing, no shading, no photorealism, only blue and white.",
+  "params": {
+    "model": "gpt-image-2",
+    "size": "1536x1024",
+    "quality": "high",
+    "n": 1,
+    "stream": true,
+    "partial_images": 2,
+    "output_format": "png"
+  },
+  "model": "gpt-image-2",
+  "usage": {
+    "input_tokens": 276,
+    "input_tokens_details": {
+      "image_tokens": 0,
+      "text_tokens": 276
+    },
+    "output_tokens": 5667,
+    "output_tokens_details": {
+      "image_tokens": 5667,
+      "text_tokens": 0
+    },
+    "total_tokens": 5943
+  },
+  "seconds": 85.9,
+  "generated": "2026-10-02T12:24:43Z"
+}
