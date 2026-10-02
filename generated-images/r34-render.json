@@ -1,0 +1,28 @@
+{
+  "prompt": "Final photorealistic 3D render of a 1999 Nissan Skyline GT-R R34 coupe, early first-year model, in Bayside Blue metallic paint. Three-quarter front view from a slightly low camera, 35mm lens, car fills the frame. Clean studio environment: seamless dark charcoal backdrop, large overhead softbox creating long soft highlight bands along the roofline, bonnet and doors, glossy floor with a subtle reflection. Physically based rendering look: accurate metallic clear-coat paint with fine flake, polished aluminium five-spoke wheels with visible brake calipers behind, realistic tire sidewalls, glass with faint reflections, crisp panel gaps, clean HDRI reflections. Accurate R34 details: twin rectangular headlamps, hood vents on the bonnet, large rear wing, flared arches, side skirts, front lip. No people, no text, no logos, no watermark.",
+  "params": {
+    "model": "gpt-image-2",
+    "size": "1536x1024",
+    "quality": "high",
+    "n": 1,
+    "stream": true,
+    "partial_images": 2,
+    "output_format": "png"
+  },
+  "model": "gpt-image-2",
+  "usage": {
+    "input_tokens": 186,
+    "input_tokens_details": {
+      "image_tokens": 0,
+      "text_tokens": 186
+    },
+    "output_tokens": 5667,
+    "output_tokens_details": {
+      "image_tokens": 5667,
+      "text_tokens": 0
+    },
+    "total_tokens": 5853
+  },
+  "seconds": 102.5,
+  "generated": "2026-10-02T12:26:29Z"
+}
